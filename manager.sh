@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.2.0
+# TorrServer Docker Manager v1.3.0
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.2.0"
+MANAGER_VERSION="1.3.0"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -23,6 +23,7 @@ CADDYFILE="${APP_DIR}/Caddyfile"
 CERT_DIR="/opt/certs/torr"
 IMAGE="ghcr.io/yourok/torrserver"
 DEFAULT_PORT="8090"
+LE_ACME_CA="https://acme-v02.api.letsencrypt.org/directory"
 
 die(){ echo -e "\e[31mОшибка: $*\e[0m" >&2; return 1; }
 info(){ echo -e "\e[36m$*\e[0m"; }
@@ -81,9 +82,14 @@ self_update(){
   chmod 700 "$tmp"
   bash -n "$tmp" || die "Скачанный manager.sh содержит синтаксическую ошибку."
   [[ -s "$tmp" ]] || die "Скачанный manager.sh пустой."
+  local embedded
+  embedded="$(grep -E '^MANAGER_VERSION="[0-9]+\.[0-9]+\.[0-9]+"$' "$tmp" | head -n1 | cut -d'"' -f2 || true)"
+  [[ "$embedded" == "$remote" ]] || die "VERSION на GitHub ($remote) не совпадает с MANAGER_VERSION в manager.sh (${embedded:-не найден})."
   mkdir -p "$APP_DIR"
   if [[ -f "$APP_DIR/manager.sh" ]]; then cp -a "$APP_DIR/manager.sh" "$backup"; fi
   install -m 755 "$tmp" "$APP_DIR/manager.sh"
+  printf '%s\n' "$remote" >"$APP_DIR/VERSION"
+  chmod 644 "$APP_DIR/VERSION"
   rm -f "$tmp"
   trap - RETURN
   ok "Менеджер обновлён: v$MANAGER_VERSION → v$remote"
@@ -112,8 +118,35 @@ EOF
 }
 valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
 port_free(){
-  valid_port "$1" || return 1
-  ! ss -H -ltn "( sport = :$1 )" 2>/dev/null | grep -q .
+  local p="$1" hex
+  valid_port "$p" || return 1
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -H -ltn "( sport = :$p )" 2>/dev/null | grep -q .
+    return
+  fi
+  hex="$(printf '%04X' "$p")"
+  ! awk -v p=":${hex}" '$2 ~ p"$" && $4 == "0A" {found=1} END{exit found?0:1}' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+valid_ipv4(){
+  local ip="$1" IFS=. o
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+  read -r -a o <<<"$ip"
+  [[ ${#o[@]} -eq 4 ]] || return 1
+  local n
+  for n in "${o[@]}"; do [[ "$n" =~ ^[0-9]+$ ]] && ((10#$n <= 255)) || return 1; done
+}
+valid_private_ipv4(){
+  local ip="$1"
+  valid_ipv4 "$ip" || return 1
+  [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]
+}
+host_has_ipv4(){
+  local needle="$1"
+  if command -v ip >/dev/null 2>&1; then
+    ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$needle"
+  else
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF "$needle"
+  fi
 }
 valid_domain(){ [[ "$1" =~ ^([A-Za-z0-9]([-A-Za-z0-9]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 get_public_ip(){
@@ -131,7 +164,7 @@ check_dns(){
 install_packages(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y ca-certificates curl jq ufw openssl cron
+  apt-get install -y ca-certificates curl jq ufw openssl cron iproute2
   if ! command -v docker >/dev/null 2>&1; then
     curl -fsSL https://get.docker.com | sh
   fi
@@ -156,7 +189,21 @@ setup_auth(){
   chmod 600 "$CONFIG_DIR/accs.db"
   PRIMARY_USER="$login"
 }
+remove_lan_firewall_rules(){
+  local p="${1:-$PORT}"
+  command -v ufw >/dev/null 2>&1 || return 0
+  valid_port "$p" || return 0
+  ufw --force delete allow from 10.0.0.0/8 to any port "$p" proto tcp >/dev/null 2>&1 || true
+  ufw --force delete allow from 172.16.0.0/12 to any port "$p" proto tcp >/dev/null 2>&1 || true
+  ufw --force delete allow from 192.168.0.0/16 to any port "$p" proto tcp >/dev/null 2>&1 || true
+}
+remove_public_firewall_rules(){
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+  ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+}
 firewall_lan(){
+  remove_public_firewall_rules
   command -v ufw >/dev/null 2>&1 || return 0
   ufw default deny incoming
   ufw default allow outgoing
@@ -176,7 +223,8 @@ firewall_public(){
   ufw --force enable
 }
 write_lan_compose(){
-  [[ "$BIND_IP" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]] || die "Для LAN режима BIND_IP должен быть приватным IPv4-адресом."
+  valid_private_ipv4 "$BIND_IP" || die "Для LAN режима BIND_IP должен быть корректным приватным IPv4-адресом."
+  host_has_ipv4 "$BIND_IP" || die "IP $BIND_IP не назначен ни одному IPv4-интерфейсу этого сервера."
   cat >"$COMPOSE" <<EOF
 services:
   torrserver:
@@ -240,7 +288,7 @@ EOF
   cat >"$CADDYFILE" <<EOF
 {
   email ${EMAIL}
-  auto_https on
+  acme_ca ${LE_ACME_CA}
 }
 ${DOMAIN} {
   reverse_proxy torrserver:8090
@@ -254,7 +302,7 @@ start_stack(){
   docker compose ps
 }
 install_torr(){
-  [[ ! -d "$APP_DIR" ]] || { warn "Установка уже существует. Используйте управление."; return; }
+  [[ ! -f "$CONF" ]] || { warn "TorrServer уже установлен. Используйте управление."; return; }
   echo "============================================="
   echo "  Установка TorrServer Docker"
   echo "============================================="
@@ -272,8 +320,8 @@ install_torr(){
     if [[ "$MODE" == "lan" ]]; then
       while :; do
         read -rp "Приватный IPv4 адрес сервера в LAN (например 192.168.1.10): " BIND_IP
-        [[ "$BIND_IP" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]] && break
-        warn "Нужен адрес из 10.0.0.0/8, 172.16.0.0/12 или 192.168.0.0/16."
+        if valid_private_ipv4 "$BIND_IP" && host_has_ipv4 "$BIND_IP"; then break; fi
+        warn "Нужен приватный IPv4, реально назначенный интерфейсу сервера."
       done
     else
       BIND_IP=""
@@ -301,6 +349,8 @@ install_torr(){
       [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && break
       warn "Некорректный email."
     done
+    port_free 80 || { warn "Порт 80 уже занят. Освободите его перед PUBLIC-установкой."; return; }
+    port_free 443 || { warn "Порт 443 уже занят. Освободите его перед PUBLIC-установкой."; return; }
   else
     DOMAIN=""; EMAIL=""
   fi
@@ -335,20 +385,36 @@ status(){
   if [[ ! -f "$CONF" ]]; then echo "Не установлен"; return; fi
   load_config
   echo "Режим: $MODE"
-  [[ "$MODE" == "public" ]] && echo "Домен: $DOMAIN"
+  if [[ "$MODE" == "public" ]]; then
+    echo "Домен: $DOMAIN"
+    echo "URL: https://$DOMAIN"
+  else
+    echo "LAN IP: $BIND_IP"
+    echo "URL: http://$BIND_IP:$PORT"
+  fi
   echo "Порт: $PORT"
   (cd "$APP_DIR" && docker compose ps 2>/dev/null) || true
 }
 change_version(){
   [[ -f "$COMPOSE" ]] || { warn "Не установлен."; return; }
-  local v
+  local v old backup env_backup
   read -rp "Версия TorrServer (например MatriX.142.2 или latest): " v
   [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "Недопустимая версия."; return; }
-  cp -a "$CONFIG_DIR" "${APP_DIR}/config.backup.$(date +%Y%m%d-%H%M%S)"
-  sed -i "s/^TORRSERVER_VERSION=.*/TORRSERVER_VERSION=${v}/" "${APP_DIR}/.env" 2>/dev/null || true
-  echo "TORRSERVER_VERSION=${v}" >"${APP_DIR}/.env"
-  (cd "$APP_DIR" && docker compose pull torrserver && docker compose up -d torrserver)
-  ok "Версия обновлена: $v"
+  old="$(grep -E '^TORRSERVER_VERSION=' "${APP_DIR}/.env" 2>/dev/null | cut -d= -f2- || true)"
+  old="${old:-latest}"
+  backup="${APP_DIR}/config.backup.$(date +%Y%m%d-%H%M%S)"
+  env_backup="${APP_DIR}/.env.backup.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$CONFIG_DIR" "$backup"
+  [[ -f "${APP_DIR}/.env" ]] && cp -a "${APP_DIR}/.env" "$env_backup" || true
+  printf 'TORRSERVER_VERSION=%s\n' "$v" >"${APP_DIR}/.env"
+  if ! (cd "$APP_DIR" && docker compose pull torrserver && docker compose up -d torrserver); then
+    warn "Обновление не удалось. Выполняется откат на $old."
+    printf 'TORRSERVER_VERSION=%s\n' "$old" >"${APP_DIR}/.env"
+    (cd "$APP_DIR" && docker compose up -d torrserver) || true
+    return 1
+  fi
+  ok "Версия TorrServer установлена: $v"
+  ok "Резервная копия конфигурации: $backup"
 }
 restart_stack(){ (cd "$APP_DIR" && docker compose restart); }
 logs(){ (cd "$APP_DIR" && docker compose logs --tail=200 -f); }
@@ -367,7 +433,7 @@ manage_users(){
         read -rsp "Пароль: " p; echo; read -rsp "Повтор: " p2; echo
         [[ "$p" == "$p2" && ${#p} -ge 8 ]] || { warn "Пароль неверен."; continue; }
         jq --arg u "$u" --arg p "$p" '.+{($u):$p}' "$CONFIG_DIR/accs.db" >"${CONFIG_DIR}/accs.db.tmp" &&
-          mv "${CONFIG_DIR}/accs.db.tmp" "$CONFIG_DIR/accs.db" && docker restart torrserver >/dev/null
+          mv "${CONFIG_DIR}/accs.db.tmp" "$CONFIG_DIR/accs.db" && chmod 600 "$CONFIG_DIR/accs.db" && docker restart torrserver >/dev/null
         ;;
       3)
         local u p p2
@@ -376,7 +442,7 @@ manage_users(){
         read -rsp "Новый пароль: " p; echo; read -rsp "Повтор: " p2; echo
         [[ "$p" == "$p2" && ${#p} -ge 8 ]] || { warn "Пароль неверен."; continue; }
         jq --arg u "$u" --arg p "$p" '.[$u]=$p' "$CONFIG_DIR/accs.db" >"${CONFIG_DIR}/accs.db.tmp" &&
-          mv "${CONFIG_DIR}/accs.db.tmp" "$CONFIG_DIR/accs.db" && docker restart torrserver >/dev/null
+          mv "${CONFIG_DIR}/accs.db.tmp" "$CONFIG_DIR/accs.db" && chmod 600 "$CONFIG_DIR/accs.db" && docker restart torrserver >/dev/null
         ;;
       4)
         local u
@@ -384,7 +450,7 @@ manage_users(){
         [[ "$u" != "$PRIMARY_USER" ]] || { warn "Главного пользователя удалить нельзя."; continue; }
         jq -e --arg u "$u" 'has($u)' "$CONFIG_DIR/accs.db" >/dev/null || { warn "Нет такого пользователя."; continue; }
         jq --arg u "$u" 'del(.[$u])' "$CONFIG_DIR/accs.db" >"${CONFIG_DIR}/accs.db.tmp" &&
-          mv "${CONFIG_DIR}/accs.db.tmp" "$CONFIG_DIR/accs.db" && docker restart torrserver >/dev/null
+          mv "${CONFIG_DIR}/accs.db.tmp" "$CONFIG_DIR/accs.db" && chmod 600 "$CONFIG_DIR/accs.db" && docker restart torrserver >/dev/null
         ;;
       0) return;;
       *) warn "Неверный выбор.";;
@@ -394,30 +460,60 @@ manage_users(){
 switch_mode(){
   [[ -f "$CONF" ]] || { warn "Не установлен."; return; }
   load_config
+  local old_mode="$MODE" old_port="$PORT" old_domain="$DOMAIN" old_email="$EMAIL" old_bind="$BIND_IP" a
+  cp -a "$COMPOSE" "${COMPOSE}.mode-backup" 2>/dev/null || true
+  cp -a "$CADDYFILE" "${CADDYFILE}.mode-backup" 2>/dev/null || true
   if [[ "$MODE" == "lan" ]]; then
     warn "Переключение LAN → PUBLIC потребует домен, DNS и Let's Encrypt."
     read -rp "Перейти в PUBLIC? [y/N]: " a
     [[ "$a" =~ ^[Yy]$ ]] || return
     while :; do read -rp "Домен: " DOMAIN; valid_domain "$DOMAIN" && check_dns "$DOMAIN" && break; done
     while :; do read -rp "Email: " EMAIL; [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && break; done
-    MODE="public"; PORT="443"; save_config
-    write_public_compose; firewall_public; (cd "$APP_DIR" && docker compose up -d)
+    port_free 80 || { warn "Порт 80 занят."; return; }
+    port_free 443 || { warn "Порт 443 занят."; return; }
+    MODE="public"; PORT="443"; BIND_IP=""
+    write_public_compose
+    if ! (cd "$APP_DIR" && docker compose down && docker compose pull && docker compose up -d); then
+      warn "Не удалось включить PUBLIC. Восстанавливаю предыдущий режим."
+      MODE="$old_mode"; PORT="$old_port"; DOMAIN="$old_domain"; EMAIL="$old_email"; BIND_IP="$old_bind"
+      mv -f "${COMPOSE}.mode-backup" "$COMPOSE" 2>/dev/null || true
+      mv -f "${CADDYFILE}.mode-backup" "$CADDYFILE" 2>/dev/null || true
+      save_config
+      (cd "$APP_DIR" && docker compose up -d) || true
+      return 1
+    fi
+    remove_lan_firewall_rules "$old_port"
+    firewall_public
+    save_config
     ok "PUBLIC режим включен: https://${DOMAIN}"
   else
-    warn "Переключение PUBLIC → LAN отключит внешний HTTPS и оставит TorrServer доступным только из LAN через UFW."
+    warn "Переключение PUBLIC → LAN отключит внешний HTTPS и оставит TorrServer доступным только из LAN."
     read -rp "Перейти в LAN? [y/N]: " a
     [[ "$a" =~ ^[Yy]$ ]] || return
     MODE="lan"
     while :; do
       read -rp "Приватный IPv4 адрес сервера в LAN: " BIND_IP
-      [[ "$BIND_IP" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]] && break
-      warn "Нужен приватный IPv4-адрес."
+      if valid_private_ipv4 "$BIND_IP" && host_has_ipv4 "$BIND_IP"; then break; fi
+      warn "Нужен приватный IPv4, назначенный интерфейсу сервера."
     done
-    while :; do read -rp "LAN-порт [8090]: " PORT; PORT="${PORT:-8090}"; port_free "$PORT" && break; done
-    DOMAIN=""; EMAIL=""; save_config
-    write_lan_compose; firewall_lan; (cd "$APP_DIR" && docker compose down && docker compose up -d)
-    ok "LAN режим включен."
+    while :; do read -rp "LAN-порт [8090]: " PORT; PORT="${PORT:-8090}"; port_free "$PORT" && break || warn "Порт занят или неверен."; done
+    DOMAIN=""; EMAIL=""
+    write_lan_compose
+    if ! (cd "$APP_DIR" && docker compose down && docker compose pull torrserver && docker compose up -d); then
+      warn "Не удалось включить LAN. Восстанавливаю предыдущий режим."
+      MODE="$old_mode"; PORT="$old_port"; DOMAIN="$old_domain"; EMAIL="$old_email"; BIND_IP="$old_bind"
+      mv -f "${COMPOSE}.mode-backup" "$COMPOSE" 2>/dev/null || true
+      mv -f "${CADDYFILE}.mode-backup" "$CADDYFILE" 2>/dev/null || true
+      save_config
+      (cd "$APP_DIR" && docker compose up -d) || true
+      return 1
+    fi
+    remove_public_firewall_rules
+    firewall_lan
+    save_config
+    ok "LAN режим включен: http://${BIND_IP}:${PORT}"
   fi
+  rm -f "${COMPOSE}.mode-backup" "${CADDYFILE}.mode-backup"
 }
 uninstall(){
   [[ -d "$APP_DIR" ]] || { warn "Не установлен."; return; }
@@ -425,28 +521,61 @@ uninstall(){
   [[ "$a" =~ ^[Yy]$ ]] || return
   load_config || true
   if command -v ufw >/dev/null 2>&1; then
-    [[ "${MODE:-lan}" == "public" ]] && { ufw delete allow 80/tcp >/dev/null 2>&1 || true; ufw delete allow 443/tcp >/dev/null 2>&1 || true; }
+    remove_public_firewall_rules
+    remove_lan_firewall_rules "${PORT:-$DEFAULT_PORT}"
   fi
   (cd "$APP_DIR" && docker compose down -v 2>/dev/null || true)
   rm -rf "$APP_DIR" "$CERT_DIR"
   ok "Удалено."
 }
 check_letsencrypt(){
-  [[ -f "$CONF" ]] || { warn "Не установлен."; return; }
+  [[ -f "$CONF" ]] || { warn "Не установлен."; return 1; }
   load_config
   if [[ "$MODE" != "public" ]]; then
     warn "Let's Encrypt используется только в PUBLIC режиме."
-    return
+    return 1
   fi
+  local failed=0 issuer="" dates=""
   info "Проверка Let's Encrypt для ${DOMAIN}"
-  echo "DNS:"
-  getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true
-  echo "HTTP challenge:"
-  curl -I --max-time 10 "http://${DOMAIN}/.well-known/acme-challenge/test" 2>&1 | head -n 5 || true
-  echo "Caddy:"
-  docker exec torrserver-caddy caddy version 2>/dev/null || warn "Контейнер Caddy не запущен."
-  echo "Логи Caddy (последние 30 строк):"
-  docker logs --tail 30 torrserver-caddy 2>&1 || true
+  if check_dns "$DOMAIN"; then ok "DNS A-запись соответствует публичному IPv4 сервера."; else failed=1; fi
+  if docker ps --format '{{.Names}}' | grep -qx 'torrserver-caddy'; then
+    ok "Caddy запущен."
+    docker exec torrserver-caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 && ok "Caddyfile валиден." || { warn "Caddyfile не проходит caddy validate."; failed=1; }
+  else
+    warn "Контейнер Caddy не запущен."
+    failed=1
+  fi
+  if timeout 12 openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout >/dev/null 2>&1; then
+    issuer="$(timeout 12 openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null || true)"
+    dates="$(timeout 12 openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -dates 2>/dev/null || true)"
+    echo "$issuer"
+    echo "$dates"
+    if grep -qi "Let's Encrypt" <<<"$issuer"; then ok "Сертификат выдан Let's Encrypt."; else warn "TLS работает, но издатель не распознан как Let's Encrypt."; failed=1; fi
+  else
+    warn "Не удалось получить TLS-сертификат с ${DOMAIN}:443."
+    failed=1
+  fi
+  echo "Последние сообщения Caddy об ACME/TLS:"
+  docker logs --tail 100 torrserver-caddy 2>&1 | grep -Ei 'certificate|acme|tls|issuer|renew' | tail -n 30 || true
+  (( failed == 0 )) && ok "Проверка Let's Encrypt завершена успешно." || { warn "Обнаружены проблемы Let's Encrypt/TLS."; return 1; }
+}
+doctor(){
+  local failed=0
+  info "Диагностика TorrServer Docker Manager v${MANAGER_VERSION}"
+  for cmd in bash curl docker jq ss ip openssl; do
+    command -v "$cmd" >/dev/null 2>&1 && ok "$cmd: OK" || { warn "$cmd: не найден"; failed=1; }
+  done
+  docker compose version >/dev/null 2>&1 && ok "docker compose: OK" || { warn "docker compose: недоступен"; failed=1; }
+  if [[ -f "$CONF" ]]; then
+    load_config || { warn "manager.conf повреждён"; failed=1; }
+    [[ -f "$COMPOSE" ]] && ok "docker-compose.yml: найден" || { warn "docker-compose.yml отсутствует"; failed=1; }
+    (cd "$APP_DIR" && docker compose config >/dev/null 2>&1) && ok "Docker Compose config: валиден" || { warn "Docker Compose config: ошибка"; failed=1; }
+    [[ -f "$CONFIG_DIR/accs.db" ]] && jq -e 'type=="object"' "$CONFIG_DIR/accs.db" >/dev/null 2>&1 && ok "accs.db: валиден" || { warn "accs.db отсутствует или повреждён"; failed=1; }
+    if [[ "$MODE" == "public" ]]; then check_letsencrypt || failed=1; fi
+  else
+    info "TorrServer ещё не установлен; проверена только среда менеджера."
+  fi
+  (( failed == 0 )) && ok "Диагностика завершена без ошибок." || return 1
 }
 main(){
   require_root
@@ -456,10 +585,12 @@ main(){
     logs) logs; return ;;
     status) status; return ;;
     check-le|check-ssl|ssl) check_letsencrypt; return ;;
-    check-update|version) check_manager_update; return $? ;;
+    check-update) check_manager_update; return $? ;;
+    version) echo "v${MANAGER_VERSION}"; return ;;
     self-update|update-manager) self_update; return ;;
+    doctor|check) doctor; return ;;
     menu|"") ;;
-    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le|check-update|self-update}"; return 1 ;;
+    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le|check-update|self-update|doctor|version}"; return 1 ;;
   esac
   while :; do
     echo
@@ -478,6 +609,7 @@ main(){
     echo "7. Удалить"
     echo "8. Проверить обновление менеджера"
     echo "9. Обновить сам менеджер с GitHub"
+    echo "10. Диагностика проекта"
     echo "0. Выход"
     echo "=============================================="
     read -rp "Выбор: " c
@@ -491,9 +623,12 @@ main(){
       7) uninstall;;
       8) check_manager_update || true;;
       9) self_update;;
+      10) doctor || true;;
       0) exit 0;;
       *) warn "Неверный выбор.";;
     esac
   done
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -1,70 +1,64 @@
 # TorrServer Docker Manager
 
-Docker-менеджер для **TorrServer** с двумя режимами установки:
-
-- **LAN** — TorrServer доступен по обычному HTTP только на выбранном приватном IPv4-адресе локальной сети. **Let's Encrypt, домен и Caddy не используются.**
-- **PUBLIC** — TorrServer работает за Caddy и доступен по HTTPS. Скрипт требует домен, проверяет DNS и настраивает автоматическое получение/продление сертификата Let's Encrypt.
-
+**Текущая версия менеджера: v1.3.0**  
 Автор: **Chistovik92**
 
-## Что изменено
+Docker-менеджер для TorrServer с двумя сценариями развёртывания:
 
-Исходный вариант был рассчитан только на публичный сервер с доменом и выпуском сертификата через `acme.sh`. В этой версии добавлен отдельный LAN-сценарий и переключение между LAN/PUBLIC после установки.
+- **LAN** — HTTP-доступ только через выбранный приватный IPv4 сервера. Домен, Caddy и Let's Encrypt не требуются.
+- **PUBLIC** — HTTPS через Caddy. Домен обязателен, DNS проверяется, сертификат выпускается и продлевается через **Let's Encrypt**.
 
-В LAN-режиме порт контейнера привязывается не к `0.0.0.0`, а к указанному приватному IPv4-адресу сервера. UFW дополнительно разрешает TCP-порт только из приватных IPv4-сетей.
+## Установка
 
-В PUBLIC-режиме используется Caddy с автоматическим HTTPS/Let's Encrypt. Публичный интерфейс — `443`, HTTP `80` нужен Caddy для ACME/redirect.
-
-## Требования
-
-- Debian/Ubuntu с `apt` и `systemd`.
-- root или `sudo`.
-- Интернет для установки Docker/образов.
-- Для LAN: сервер должен иметь приватный IPv4 в LAN.
-- Для PUBLIC: домен должен иметь A-запись на публичный IP сервера; порты TCP 80/443 должны быть доступны извне.
-
-## Быстрая установка
+Рекомендуемый вариант устанавливает менеджер как системную команду `torrserver`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Chistovik92/torrserver-docker-manager/main/manager.sh -o manager.sh
+curl -fsSL https://raw.githubusercontent.com/Chistovik92/torrserver-docker-manager/main/install.sh | sudo bash
+```
+
+После этого:
+
+```bash
+sudo torrserver
+```
+
+Также `manager.sh` можно запускать локально из каталога проекта:
+
+```bash
 chmod +x manager.sh
 sudo ./manager.sh
 ```
 
-Или:
+## Режим LAN
 
-```bash
-wget -O manager.sh https://raw.githubusercontent.com/Chistovik92/torrserver-docker-manager/main/manager.sh
-chmod +x manager.sh
-sudo ./manager.sh
-```
-
-## LAN-режим
-
-При установке выбрать `1. LAN`, затем указать приватный IP сервера, например:
+При установке выберите `LAN`, укажите приватный IPv4, реально назначенный интерфейсу сервера, и порт. Например:
 
 ```text
-192.168.1.10
+192.168.1.10:8090
 ```
 
-После установки доступ:
+Доступ:
 
 ```text
 http://192.168.1.10:8090
 ```
 
-Порт можно изменить в процессе установки.
+Docker привязывает опубликованный порт именно к выбранному LAN-IP, а UFW разрешает подключение к нему только из приватных IPv4-сетей `10.0.0.0/8`, `172.16.0.0/12` и `192.168.0.0/16`.
 
-**Важно:** LAN-режим не является способом публикации TorrServer в Интернет. Если сервер находится у VPS-провайдера и его адрес публичный, не указывайте публичный IP как `BIND_IP`.
+## Режим PUBLIC
 
-## PUBLIC-режим
+Для внешнего сервера выберите `PUBLIC`. Скрипт обязательно запросит:
 
-Выбрать `2. PUBLIC` и указать:
+1. домен с A-записью на публичный IPv4 сервера;
+2. email ACME/Let's Encrypt.
 
-1. домен, например `torr.example.com`;
-2. email для Let's Encrypt.
+Порты TCP `80` и `443` должны быть свободны на сервере и доступны извне. TorrServer не публикует порт `8090` наружу: запросы идут через Caddy.
 
-После проверки DNS Caddy будет получать и автоматически продлевать сертификат.
+В v1.3.0 Caddy явно настроен на production ACME endpoint Let's Encrypt:
+
+```text
+https://acme-v02.api.letsencrypt.org/directory
+```
 
 Доступ:
 
@@ -72,131 +66,188 @@ http://192.168.1.10:8090
 https://torr.example.com
 ```
 
-## Управление
-
-После установки снова запускайте:
+## Команды управления
 
 ```bash
-sudo /path/to/manager.sh
+sudo torrserver                 # интерактивное меню
+sudo torrserver status          # состояние и URL
+sudo torrserver update          # обновить/понизить TorrServer
+sudo torrserver restart         # перезапустить контейнеры
+sudo torrserver logs            # логи Docker Compose
+sudo torrserver check-le        # проверить DNS/Caddy/сертификат Let's Encrypt
+sudo torrserver check-update    # проверить новую версию менеджера на GitHub
+sudo torrserver self-update     # обновить manager.sh с GitHub
+sudo torrserver doctor          # комплексная диагностика проекта
+sudo torrserver version         # показать версию менеджера
 ```
 
-Меню позволяет:
+## Обновление TorrServer
 
-1. установить TorrServer;
-2. обновить/понизить версию;
-3. управлять пользователями;
-4. переключить LAN/PUBLIC;
-5. перезапустить сервисы;
-6. смотреть логи;
-7. удалить установку.
-
-Для прямого управления Docker также доступны:
+Команда:
 
 ```bash
-cd /opt/torr-docker
-docker compose ps
-docker compose logs --tail=200 -f
-docker compose restart
-docker compose pull
-docker compose up -d
-docker compose down
+sudo torrserver update
 ```
 
-## Данные
+принимает `latest` или тег образа, например `MatriX.142.2`. Перед изменением создаётся резервная копия `/opt/torr-docker/config`. Если `docker compose pull/up` завершается ошибкой, менеджер восстанавливает предыдущий тег TorrServer и пытается поднять прежнюю версию.
 
-Конфигурация TorrServer:
+Текущий тег хранится в:
 
 ```text
-/opt/torr-docker/config
+/opt/torr-docker/.env
 ```
 
-Состояние менеджера:
-
-```text
-/opt/torr-docker/manager.conf
-```
-
-В PUBLIC-режиме данные Caddy хранятся в Docker volumes `caddy_data` и `caddy_config`.
-
-## Версия TorrServer
-
-Менеджер поддерживает тег образа через `.env`:
+## Проверка Let's Encrypt
 
 ```bash
-cd /opt/torr-docker
-printf 'TORRSERVER_VERSION=latest\n' > .env
-docker compose pull torrserver
-docker compose up -d torrserver
+sudo torrserver check-le
 ```
 
-Например:
+Проверяются:
 
-```text
-TORRSERVER_VERSION=MatriX.142.2
-```
+- A-запись домена и публичный IPv4 сервера;
+- наличие запущенного Caddy;
+- `caddy validate` для активного Caddyfile;
+- TLS-соединение на `443`;
+- issuer и сроки действия сертификата через OpenSSL;
+- последние ACME/TLS-сообщения Caddy.
 
-Перед сменой версии менеджер создаёт резервную копию каталога конфигурации.
+Команда предназначена только для режима `PUBLIC`.
 
-## Безопасность
+## Самообновление менеджера
 
-- В TorrServer включена HTTP-аутентификация.
-- Пароль при установке не сохраняется в `manager.conf`.
-- LAN-порт разрешается UFW только из приватных IPv4-сетей.
-- В PUBLIC-режиме TorrServer не публикуется напрямую наружу: внешний доступ идёт через Caddy.
-- Не храните `manager.conf`, `accs.db` или резервные копии конфигурации в публичном Git-репозитории.
-- Не коммитьте реальные пароли, домены внутренней инфраструктуры или приватные ключи.
+Версия проекта хранится одновременно в `VERSION` и `MANAGER_VERSION` внутри `manager.sh`.
 
-## Структура
-
-```text
-.
-├── manager.sh
-├── README.md
-├── LICENSE
-├── .gitignore
-└── examples/
-    └── docker-compose.public.yml
-```
-
-## Лицензия
-
-MIT. См. `LICENSE`.
-
-> Примечание: проект не содержит исходники TorrServer/Caddy. Используются официальные контейнерные образы, указанные в конфигурации.
-
-## Обновление самого менеджера
-
-Менеджер имеет собственную версию в файле `VERSION` и при запуске меню проверяет GitHub. Источник версии и скрипта: `https://raw.githubusercontent.com/Chistovik92/torrserver-docker-manager/main/`.
-
-Проверить обновление вручную:
+Проверка:
 
 ```bash
 sudo torrserver check-update
 ```
 
-Обновить только менеджер:
+Обновление:
 
 ```bash
 sudo torrserver self-update
 ```
 
-При обновлении скрипт сначала скачивает новую версию во временный файл, проверяет `bash -n`, затем сохраняет резервную копию текущего `manager.sh` и атомарно устанавливает новую версию. Откат на более старую версию через `self-update` автоматически не выполняется.
+Перед заменой менеджер:
 
-Проверка GitHub не блокирует работу TorrServer: если GitHub временно недоступен, сервис продолжает работать.
+1. получает `VERSION` из GitHub;
+2. скачивает новый `manager.sh` во временный файл;
+3. выполняет `bash -n`;
+4. сверяет `VERSION` с `MANAGER_VERSION` скачанного файла;
+5. создаёт резервную копию текущего скрипта;
+6. устанавливает новую версию и обновляет `/opt/torr-docker/VERSION`.
 
-## Управление после установки
+Автоматический downgrade самого менеджера запрещён.
 
-Менеджер устанавливается в `/opt/torr-docker/manager.sh` и вызывается командой `torrserver`.
+## Диагностика
 
 ```bash
-torrserver menu        # интерактивное меню
-torrserver status      # состояние контейнеров
-torrserver update      # обновить/понизить TorrServer
-torrserver restart     # перезапустить стек
-torrserver logs        # посмотреть логи
-torrserver check-le    # проверить DNS, HTTP challenge и Caddy/Let's Encrypt
-torrserver check-update # проверить новую версию менеджера на GitHub
-torrserver self-update # обновить менеджер с GitHub
+sudo torrserver doctor
 ```
 
-В LAN-режиме Docker публикует TorrServer только на указанный приватный IP-адрес сервера, например `192.168.1.10:8090`.
+Проверяет основные утилиты, Docker Compose, текущий `docker-compose.yml`, JSON базы пользователей и, в PUBLIC-режиме, дополнительно запускает проверку Let's Encrypt.
+
+## Пользователи
+
+TorrServer запускается с HTTP-аутентификацией. База пользователей:
+
+```text
+/opt/torr-docker/config/accs.db
+```
+
+Права файла после создания, добавления пользователя, смены пароля и удаления пользователя принудительно устанавливаются в `0600`. Главного пользователя удалить через менеджер нельзя.
+
+## Переключение LAN / PUBLIC
+
+Менеджер поддерживает оба направления. При переключении конфигурация Compose создаётся заново, стек перезапускается, а устаревшие UFW-правила предыдущего режима удаляются. При ошибке запуска выполняется попытка возврата к предыдущей конфигурации.
+
+## Данные
+
+```text
+/opt/torr-docker/manager.sh       # установленный менеджер
+/opt/torr-docker/VERSION          # установленная версия менеджера
+/opt/torr-docker/manager.conf     # режим и параметры
+/opt/torr-docker/docker-compose.yml
+/opt/torr-docker/config/          # данные TorrServer и accs.db
+/opt/torr-docker/.env             # тег TorrServer
+```
+
+Caddy хранит ACME-состояние и сертификаты в Docker volumes `caddy_data` и `caddy_config`.
+
+## Требования
+
+- Debian/Ubuntu с `apt` и `systemd`;
+- root или `sudo`;
+- Docker Engine + Docker Compose plugin (при отсутствии Docker устанавливается автоматически);
+- интернет для образов и GitHub;
+- в PUBLIC-режиме — корректный DNS и доступные TCP 80/443.
+
+## Структура репозитория
+
+```text
+.
+├── manager.sh
+├── install.sh
+├── torrserver
+├── VERSION
+├── README.md
+├── LICENSE
+├── .gitignore
+├── examples/
+│   └── docker-compose.public.yml
+└── tests/
+    └── smoke.sh
+```
+
+## Версионность
+
+Проект использует формат **Semantic Versioning**: `MAJOR.MINOR.PATCH`.
+
+- `MAJOR` — несовместимые изменения поведения/конфигурации;
+- `MINOR` — новые совместимые функции;
+- `PATCH` — исправления без изменения интерфейса.
+
+### v1.3.0 — 2026-08-17
+
+- исправлена свежая установка через `install.sh`: каталог `/opt/torr-docker` больше не считается признаком установленного TorrServer; признак установки — `manager.conf`;
+- PUBLIC-режим закреплён именно за Let's Encrypt через `acme_ca`;
+- `check-le` теперь проверяет реальный сертификат, issuer, сроки, Caddyfile и ACME/TLS-логи;
+- добавлена команда `doctor`;
+- усилена проверка LAN IPv4: адрес должен быть приватным, валидным и назначенным интерфейсу хоста;
+- исправлена очистка UFW при переключении LAN ↔ PUBLIC и удалении;
+- добавлен rollback при неудачной смене версии TorrServer;
+- добавлен rollback конфигурации при неудачном переключении режима;
+- self-update сверяет `VERSION` и `MANAGER_VERSION` до замены файла;
+- `install.sh` проверяет синтаксис скачанного менеджера и согласованность версий;
+- после изменения пользователей `accs.db` снова принудительно получает права `0600`;
+- добавлены локальные smoke-тесты.
+
+### v1.2.0
+
+- добавлены `VERSION`, `check-update` и `self-update`;
+- добавлено обновление менеджера непосредственно с GitHub;
+- менеджер устанавливается как команда `torrserver`.
+
+### v1.1.0
+
+- добавлен LAN-режим без Let's Encrypt;
+- Docker-порт LAN привязан к конкретному приватному IPv4;
+- добавлено переключение LAN/PUBLIC.
+
+### v1.0.0
+
+- базовая Docker-установка TorrServer;
+- PUBLIC-доступ через Caddy;
+- управление пользователями и версией TorrServer.
+
+## Безопасность
+
+Не добавляйте в GitHub реальные `manager.conf`, `.env`, `accs.db`, резервные копии конфигурации или другие файлы с учётными данными. LAN-режим не предназначен для публикации TorrServer в Интернет.
+
+## Лицензия
+
+MIT. См. `LICENSE`.
+
+Проект не содержит исходный код TorrServer или Caddy; используются внешние контейнерные образы.
