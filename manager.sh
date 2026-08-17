@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.4.0
+# TorrServer Docker Manager v1.5.0
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
-#   2) Public mode: Caddy reverse proxy + Let's Encrypt certificate, domain required.
+#   2) Public mode: Let's Encrypt / self-signed TLS / plain HTTP.
 # ==============================================================================
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.4.0"
+MANAGER_VERSION="1.5.0"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -110,6 +110,7 @@ load_config(){
   # shellcheck disable=SC1090
   source "$CONF"
   MODE="${MODE:-lan}"; PORT="${PORT:-$DEFAULT_PORT}"; DOMAIN="${DOMAIN:-}"; EMAIL="${EMAIL:-}"; BIND_IP="${BIND_IP:-}"
+  PUBLIC_TLS="${PUBLIC_TLS:-letsencrypt}"; PUBLIC_HOST="${PUBLIC_HOST:-${DOMAIN:-}}"
   PRIMARY_USER="${PRIMARY_USER:-}"
 }
 save_config(){
@@ -121,6 +122,8 @@ DOMAIN=${DOMAIN}
 EMAIL=${EMAIL}
 PRIMARY_USER=${PRIMARY_USER}
 BIND_IP=${BIND_IP}
+PUBLIC_TLS=${PUBLIC_TLS:-}
+PUBLIC_HOST=${PUBLIC_HOST:-}
 EOF
   chmod 600 "$CONF"
 }
@@ -209,14 +212,23 @@ backup_runtime_config(){
     [[ -f "$f" ]] && cp -a "$f" "$dir/"
   done
   [[ -d "$CONFIG_DIR" ]] && cp -a "$CONFIG_DIR" "$dir/config"
+  [[ -d "$CERT_DIR" ]] && cp -a "$CERT_DIR" "$dir/certs"
   echo "$dir"
 }
 
 caddyfile_is_current(){
-  [[ -f "$CADDYFILE" ]] || return 1
-  grep -qF "issuer acme" "$CADDYFILE" && \
-  grep -qF "dir ${LE_ACME_CA}" "$CADDYFILE" && \
-  grep -qF "test_dir ${LE_ACME_CA}" "$CADDYFILE"
+  [[ "${MODE:-}" == "public" ]] || return 0
+  case "${PUBLIC_TLS:-letsencrypt}" in
+    none) [[ ! -f "$CADDYFILE" ]] || return 1 ;;
+    letsencrypt)
+      [[ -f "$CADDYFILE" ]] || return 1
+      grep -qF "issuer acme" "$CADDYFILE" && grep -qF "dir ${LE_ACME_CA}" "$CADDYFILE" && grep -qF "test_dir ${LE_ACME_CA}" "$CADDYFILE"
+      ;;
+    selfsigned)
+      [[ -f "$CADDYFILE" ]] && grep -qF 'tls /certs/torr.crt /certs/torr.key' "$CADDYFILE"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 clear_caddy_staging_state(){
@@ -226,8 +238,12 @@ clear_caddy_staging_state(){
 
 validate_generated_config(){
   (cd "$APP_DIR" && docker compose config >/dev/null) || die "Сгенерированный docker-compose.yml невалиден."
-  if [[ "${MODE:-}" == "public" ]]; then
-    docker run --rm -v "$CADDYFILE:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile >/dev/null || die "Сгенерированный Caddyfile невалиден."
+  if [[ "${MODE:-}" == "public" && "${PUBLIC_TLS:-letsencrypt}" != "none" ]]; then
+    if [[ "${PUBLIC_TLS}" == "selfsigned" ]]; then
+      docker run --rm -v "$CADDYFILE:/etc/caddy/Caddyfile:ro" -v "$CERT_DIR:/certs:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile >/dev/null || die "Сгенерированный Caddyfile невалиден."
+    else
+      docker run --rm -v "$CADDYFILE:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile >/dev/null || die "Сгенерированный Caddyfile невалиден."
+    fi
   fi
 }
 setup_auth(){
@@ -257,9 +273,11 @@ remove_lan_firewall_rules(){
   ufw --force delete allow from 192.168.0.0/16 to any port "$p" proto tcp >/dev/null 2>&1 || true
 }
 remove_public_firewall_rules(){
+  local p="${1:-${PORT:-0}}"
   command -v ufw >/dev/null 2>&1 || return 0
   ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
   ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+  if valid_port "$p"; then ufw --force delete allow "${p}/tcp" >/dev/null 2>&1 || true; fi
 }
 firewall_lan(){
   remove_public_firewall_rules
@@ -267,18 +285,21 @@ firewall_lan(){
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow OpenSSH >/dev/null 2>&1 || true
-  # Common private IPv4 ranges only. Do not expose LAN mode to the Internet.
   ufw allow from 10.0.0.0/8 to any port "$PORT" proto tcp
   ufw allow from 172.16.0.0/12 to any port "$PORT" proto tcp
   ufw allow from 192.168.0.0/16 to any port "$PORT" proto tcp
   ufw --force enable
 }
 firewall_public(){
+  command -v ufw >/dev/null 2>&1 || return 0
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow OpenSSH >/dev/null 2>&1 || true
-  ufw allow 80/tcp
-  ufw allow 443/tcp
+  case "${PUBLIC_TLS:-letsencrypt}" in
+    letsencrypt) ufw allow 80/tcp; ufw allow 443/tcp ;;
+    selfsigned) ufw allow 443/tcp ;;
+    none) ufw allow "${PORT}/tcp" ;;
+  esac
   ufw --force enable
 }
 write_lan_compose(){
@@ -304,7 +325,30 @@ services:
 EOF
 }
 write_public_compose(){
-  cat >"$COMPOSE" <<EOF
+  case "${PUBLIC_TLS:-letsencrypt}" in
+    none)
+      cat >"$COMPOSE" <<EOF
+services:
+  torrserver:
+    image: ${IMAGE}:\${TORRSERVER_VERSION:-latest}
+    container_name: torrserver
+    restart: unless-stopped
+    environment:
+      TS_HTTPAUTH: "1"
+      TS_CONF_PATH: /opt/ts/config
+      TS_PORT: "8090"
+    volumes:
+      - ./config:/opt/ts/config
+    ports:
+      - "0.0.0.0:${PORT}:8090"
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+EOF
+      rm -f "$CADDYFILE"
+      ;;
+    letsencrypt|selfsigned)
+      cat >"$COMPOSE" <<EOF
 services:
   torrserver:
     image: ${IMAGE}:\${TORRSERVER_VERSION:-latest}
@@ -328,12 +372,25 @@ services:
     container_name: torrserver-caddy
     restart: unless-stopped
     ports:
-      - "80:80"
       - "443:443"
+EOF
+      if [[ "$PUBLIC_TLS" == "letsencrypt" ]]; then
+        cat >>"$COMPOSE" <<EOF
+      - "80:80"
+EOF
+      fi
+      cat >>"$COMPOSE" <<EOF
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+EOF
+      if [[ "$PUBLIC_TLS" == "selfsigned" ]]; then
+        cat >>"$COMPOSE" <<EOF
+      - ${CERT_DIR}:/certs:ro
+EOF
+      fi
+      cat >>"$COMPOSE" <<EOF
     networks: [internal]
     depends_on: [torrserver]
 
@@ -344,7 +401,8 @@ volumes:
   caddy_data:
   caddy_config:
 EOF
-  cat >"$CADDYFILE" <<EOF
+      if [[ "$PUBLIC_TLS" == "letsencrypt" ]]; then
+        cat >"$CADDYFILE" <<EOF
 {
   email ${EMAIL}
 }
@@ -359,32 +417,56 @@ ${DOMAIN} {
   reverse_proxy torrserver:8090
 }
 EOF
+      else
+        cat >"$CADDYFILE" <<EOF
+https://${PUBLIC_HOST} {
+  tls /certs/torr.crt /certs/torr.key
+  reverse_proxy torrserver:8090
+}
+EOF
+      fi
+      ;;
+    *) die "Неизвестный PUBLIC_TLS: ${PUBLIC_TLS}" ;;
+  esac
+}
+generate_selfsigned_cert(){
+  local host="${PUBLIC_HOST:-}" san
+  [[ -n "$host" ]] || die "Не задан PUBLIC_HOST для самоподписанного сертификата."
+  mkdir -p "$CERT_DIR"
+  chmod 700 "$CERT_DIR"
+  if valid_ipv4 "$host"; then san="IP:${host}"; else san="DNS:${host}"; fi
+  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 825 \
+    -keyout "$CERT_DIR/torr.key" -out "$CERT_DIR/torr.crt" \
+    -subj "/CN=${host}" -addext "subjectAltName=${san}" >/dev/null 2>&1 || die "Не удалось создать самоподписанный сертификат."
+  chmod 600 "$CERT_DIR/torr.key"
+  chmod 644 "$CERT_DIR/torr.crt"
 }
 public_preflight(){
   local failed=0 public_ip dnsips
-  info "PUBLIC preflight для ${DOMAIN}"
   public_ip="$(get_public_ip)"
-  dnsips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u)"
-  if [[ -n "$public_ip" ]]; then
-    ok "Публичный IPv4 сервера: $public_ip"
-  else
-    warn "Не удалось определить публичный IPv4 сервера."; failed=1
-  fi
-  if [[ -n "$dnsips" ]] && grep -qx "$public_ip" <<<"$dnsips"; then
-    ok "DNS A-запись домена указывает на этот сервер."
-  else
-    warn "DNS A-запись не совпадает с публичным IPv4 сервера."; failed=1
-  fi
-  port_free 80 && ok "TCP/80 свободен локально." || { warn "TCP/80 занят локальным процессом."; failed=1; }
-  port_free 443 && ok "TCP/443 свободен локально." || { warn "TCP/443 занят локальным процессом."; failed=1; }
-  if command -v ufw >/dev/null 2>&1; then
-    info "UFW будет настроен на разрешение TCP/80 и TCP/443."
-  fi
-  if (( failed != 0 )); then
-    warn "PUBLIC preflight не пройден."
-    return 1
-  fi
-  warn "Важно: firewall/security group у VPS-провайдера и NAT/роутер тоже должны пропускать входящие TCP/80 и TCP/443."
+  [[ -n "$public_ip" ]] && ok "Публичный IPv4 сервера: $public_ip" || { warn "Не удалось определить публичный IPv4 сервера."; failed=1; }
+  case "${PUBLIC_TLS:-letsencrypt}" in
+    letsencrypt)
+      info "PUBLIC preflight: Let's Encrypt для ${DOMAIN}"
+      dnsips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u)"
+      [[ -n "$dnsips" ]] && grep -qx "$public_ip" <<<"$dnsips" && ok "DNS A-запись домена указывает на этот сервер." || { warn "DNS A-запись не совпадает с публичным IPv4 сервера."; failed=1; }
+      port_free 80 && ok "TCP/80 свободен локально." || { warn "TCP/80 занят локальным процессом."; failed=1; }
+      port_free 443 && ok "TCP/443 свободен локально." || { warn "TCP/443 занят локальным процессом."; failed=1; }
+      warn "Для Let's Encrypt входящие TCP/80 и TCP/443 должны быть доступны из Интернета."
+      ;;
+    selfsigned)
+      info "PUBLIC preflight: самоподписанный TLS"
+      port_free 443 && ok "TCP/443 свободен локально." || { warn "TCP/443 занят локальным процессом."; failed=1; }
+      warn "Клиенты будут видеть предупреждение о недоверенном сертификате, пока вы явно не добавите его в доверенные."
+      ;;
+    none)
+      info "PUBLIC preflight: HTTP без сертификата"
+      port_free "$PORT" && ok "TCP/${PORT} свободен локально." || { warn "TCP/${PORT} занят локальным процессом."; failed=1; }
+      warn "ВНИМАНИЕ: HTTP передаёт логин, пароль и трафик без TLS-шифрования. Используйте только если это осознанный выбор."
+      ;;
+    *) warn "Неизвестный тип PUBLIC_TLS: ${PUBLIC_TLS}"; failed=1 ;;
+  esac
+  (( failed == 0 )) || { warn "PUBLIC preflight не пройден."; return 1; }
 }
 local_le_certificate_ok(){
   local issuer
@@ -418,87 +500,106 @@ start_stack(){
 }
 install_torr(){
   [[ ! -f "$CONF" ]] || { warn "TorrServer уже установлен. Используйте управление."; return; }
-  echo "============================================="
-  echo "  Установка TorrServer Docker"
-  echo "============================================="
-  echo "1. LAN — HTTP только из локальных IPv4-сетей, без Let's Encrypt"
-  echo "2. PUBLIC — HTTPS через Caddy + Let's Encrypt, домен обязателен"
-  local choice
-  read -rp "Режим [1/2]: " choice
-  case "$choice" in
-    1) MODE="lan";;
-    2) MODE="public";;
-    *) warn "Неверный режим."; return;;
-  esac
-
+  local top public_choice public_ip
   while :; do
-    if [[ "$MODE" == "lan" ]]; then
-      while :; do
-        read -rp "Приватный IPv4 адрес сервера в LAN (например 192.168.1.10): " BIND_IP
-        if valid_private_ipv4 "$BIND_IP" && host_has_ipv4 "$BIND_IP"; then break; fi
-        warn "Нужен приватный IPv4, реально назначенный интерфейсу сервера."
-      done
-    else
-      BIND_IP=""
-    fi
-    read -rp "Порт TorrServer [${DEFAULT_PORT}]: " PORT
-    PORT="${PORT:-$DEFAULT_PORT}"
-    if [[ "$MODE" == "lan" ]]; then
-      port_free "$PORT" && break || warn "Порт занят или неверен."
-    else
-      # In public mode the public endpoint is always 443; this value is only internal metadata.
-      PORT="443"; break
-    fi
+    echo "============================================="
+    echo "  Установка TorrServer Docker"
+    echo "============================================="
+    echo "1. Внутренняя сеть (LAN)"
+    echo "2. Внешний доступ (PUBLIC)"
+    echo "0. Назад"
+    read -rp "Выбор: " top
+    case "$top" in
+      1) MODE="lan"; PUBLIC_TLS=""; break ;;
+      2)
+        MODE="public"; BIND_IP=""
+        while :; do
+          echo "---------------------------------------------"
+          echo " Внешний доступ — выберите защиту"
+          echo "1. Let's Encrypt (доверенный HTTPS, нужен домен)"
+          echo "2. Самоподписанный сертификат (HTTPS)"
+          echo "3. Без сертификата (HTTP)"
+          echo "4. Назад к выбору LAN / PUBLIC"
+          read -rp "Выбор: " public_choice
+          case "$public_choice" in
+            1) PUBLIC_TLS="letsencrypt"; break 2 ;;
+            2) PUBLIC_TLS="selfsigned"; break 2 ;;
+            3) PUBLIC_TLS="none"; break 2 ;;
+            4) break ;;
+            *) warn "Неверный выбор." ;;
+          esac
+        done
+        [[ "$public_choice" == "4" ]] && continue
+        ;;
+      0) return ;;
+      *) warn "Неверный выбор." ;;
+    esac
   done
 
-  if [[ "$MODE" == "public" ]]; then
+  if [[ "$MODE" == "lan" ]]; then
     while :; do
-      read -rp "Домен (например torr.example.com): " DOMAIN
-      valid_domain "$DOMAIN" || { warn "Некорректный домен."; continue; }
-      check_dns "$DOMAIN" && break
-      read -rp "Повторить проверку? [Y/n]: " a
-      [[ "${a:-Y}" =~ ^[Nn]$ ]] && return
+      read -rp "Приватный IPv4 адрес сервера в LAN (например 192.168.1.10): " BIND_IP
+      valid_private_ipv4 "$BIND_IP" && host_has_ipv4 "$BIND_IP" && break
+      warn "Нужен приватный IPv4, реально назначенный интерфейсу сервера."
     done
-    while :; do
-      read -rp "Email для Let's Encrypt: " EMAIL
-      [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && break
-      warn "Некорректный email."
-    done
-    port_free 80 || { warn "Порт 80 уже занят. Освободите его перед PUBLIC-установкой."; return; }
-    port_free 443 || { warn "Порт 443 уже занят. Освободите его перед PUBLIC-установкой."; return; }
-    public_preflight || return 1
+    while :; do read -rp "Порт TorrServer [${DEFAULT_PORT}]: " PORT; PORT="${PORT:-$DEFAULT_PORT}"; port_free "$PORT" && break || warn "Порт занят или неверен."; done
+    DOMAIN=""; EMAIL=""; PUBLIC_HOST=""
   else
-    DOMAIN=""; EMAIL=""
+    public_ip="$(get_public_ip)"
+    case "$PUBLIC_TLS" in
+      letsencrypt)
+        PORT="443"; PUBLIC_HOST=""
+        while :; do
+          read -rp "Домен (например torr.example.com): " DOMAIN
+          valid_domain "$DOMAIN" || { warn "Некорректный домен."; continue; }
+          check_dns "$DOMAIN" && break
+          read -rp "Повторить проверку? [Y/n]: " a
+          [[ "${a:-Y}" =~ ^[Nn]$ ]] && return
+        done
+        while :; do
+          read -rp "Email для Let's Encrypt: " EMAIL
+          [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && break
+          warn "Некорректный email."
+        done
+        ;;
+      selfsigned)
+        PORT="443"; EMAIL=""; DOMAIN=""
+        read -rp "Имя для сертификата [${public_ip:-public-ip}]: " PUBLIC_HOST
+        PUBLIC_HOST="${PUBLIC_HOST:-$public_ip}"
+        if ! valid_ipv4 "$PUBLIC_HOST" && ! valid_domain "$PUBLIC_HOST"; then warn "Нужно корректное доменное имя или IPv4."; return 1; fi
+        ;;
+      none)
+        DOMAIN=""; EMAIL=""; PUBLIC_HOST="${public_ip:-}"
+        while :; do read -rp "Внешний HTTP-порт [${DEFAULT_PORT}]: " PORT; PORT="${PORT:-$DEFAULT_PORT}"; port_free "$PORT" && break || warn "Порт занят или неверен."; done
+        ;;
+    esac
+    public_preflight || return 1
   fi
 
   install_packages
   mkdir -p "$APP_DIR" "$CONFIG_DIR"
-  setup_auth
-  save_config
-
-  if [[ "$MODE" == "lan" ]]; then
-    write_lan_compose
-    firewall_lan
+  if [[ -f "$CONFIG_DIR/accs.db" && -n "${PRIMARY_USER:-}" ]]; then
+    info "Существующая база пользователей сохранена."
+    chmod 600 "$CONFIG_DIR/accs.db"
   else
-    mkdir -p "$CERT_DIR"
-    write_public_compose
-    firewall_public
+    setup_auth
   fi
-
+  if [[ "$MODE" == "public" && "$PUBLIC_TLS" == "selfsigned" ]]; then generate_selfsigned_cert; fi
+  save_config
+  if [[ "$MODE" == "lan" ]]; then write_lan_compose; firewall_lan; else write_public_compose; firewall_public; fi
+  validate_generated_config
   start_stack
+
   if [[ "$MODE" == "lan" ]]; then
-    ok "Установка завершена."
-    ok "LAN: http://${BIND_IP}:${PORT}"
-    ok "Docker привязан только к LAN IP: ${BIND_IP}:${PORT}"
+    ok "Установка завершена. LAN: http://${BIND_IP}:${PORT}"
+  elif [[ "$PUBLIC_TLS" == "letsencrypt" ]]; then
+    if wait_for_letsencrypt 180; then ok "PUBLIC HTTPS готов: https://${DOMAIN}"; else warn "PUBLIC запущен, но сертификат Let's Encrypt пока не получен."; return 1; fi
+  elif [[ "$PUBLIC_TLS" == "selfsigned" ]]; then
+    ok "PUBLIC HTTPS с самоподписанным сертификатом: https://${PUBLIC_HOST}"
+    warn "Предупреждение браузера о недоверенном сертификате ожидаемо."
   else
-    if wait_for_letsencrypt 120; then
-      ok "PUBLIC-установка завершена полностью."
-      ok "HTTPS: https://${DOMAIN}"
-    else
-      warn "Контейнеры запущены, но PUBLIC-установка НЕ завершена: действующий сертификат Let's Encrypt не получен."
-      warn "Исправьте внешний firewall/NAT/маршрутизацию и выполните: sudo torrserver check-le"
-      return 1
-    fi
+    ok "PUBLIC HTTP без TLS: http://${PUBLIC_HOST:-$(get_public_ip)}:${PORT}"
+    warn "Соединение не шифруется."
   fi
 }
 status(){
@@ -506,13 +607,17 @@ status(){
   load_config
   echo "Режим: $MODE"
   if [[ "$MODE" == "public" ]]; then
-    echo "Домен: $DOMAIN"
-    echo "URL: https://$DOMAIN"
+    echo "PUBLIC TLS: ${PUBLIC_TLS:-letsencrypt}"
+    case "${PUBLIC_TLS:-letsencrypt}" in
+      letsencrypt) echo "Домен: $DOMAIN"; echo "URL: https://$DOMAIN"; echo "Порт: 443" ;;
+      selfsigned) echo "Сертификат: самоподписанный"; echo "URL: https://${PUBLIC_HOST}"; echo "Порт: 443" ;;
+      none) echo "Сертификат: отсутствует"; echo "URL: http://${PUBLIC_HOST:-$(get_public_ip)}:$PORT"; echo "Порт: $PORT" ;;
+    esac
   else
     echo "LAN IP: $BIND_IP"
     echo "URL: http://$BIND_IP:$PORT"
+    echo "Порт: $PORT"
   fi
-  echo "Порт: $PORT"
   (cd "$APP_DIR" && docker compose ps 2>/dev/null) || true
 }
 change_version(){
@@ -580,66 +685,27 @@ manage_users(){
 switch_mode(){
   [[ -f "$CONF" ]] || { warn "Не установлен."; return; }
   load_config
-  local old_mode="$MODE" old_port="$PORT" old_domain="$DOMAIN" old_email="$EMAIL" old_bind="$BIND_IP" a
-  cp -a "$COMPOSE" "${COMPOSE}.mode-backup" 2>/dev/null || true
-  cp -a "$CADDYFILE" "${CADDYFILE}.mode-backup" 2>/dev/null || true
-  if [[ "$MODE" == "lan" ]]; then
-    warn "Переключение LAN → PUBLIC потребует домен, DNS и Let's Encrypt."
-    read -rp "Перейти в PUBLIC? [y/N]: " a
-    [[ "$a" =~ ^[Yy]$ ]] || return
-    while :; do read -rp "Домен: " DOMAIN; valid_domain "$DOMAIN" && check_dns "$DOMAIN" && break; done
-    while :; do read -rp "Email: " EMAIL; [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] && break; done
-    port_free 80 || { warn "Порт 80 занят."; return; }
-    port_free 443 || { warn "Порт 443 занят."; return; }
-    MODE="public"; PORT="443"; BIND_IP=""
-    public_preflight || { MODE="$old_mode"; PORT="$old_port"; DOMAIN="$old_domain"; EMAIL="$old_email"; BIND_IP="$old_bind"; return 1; }
-    write_public_compose
-    if ! (cd "$APP_DIR" && docker compose down && docker compose pull && docker compose up -d); then
-      warn "Не удалось включить PUBLIC. Восстанавливаю предыдущий режим."
-      MODE="$old_mode"; PORT="$old_port"; DOMAIN="$old_domain"; EMAIL="$old_email"; BIND_IP="$old_bind"
-      mv -f "${COMPOSE}.mode-backup" "$COMPOSE" 2>/dev/null || true
-      mv -f "${CADDYFILE}.mode-backup" "$CADDYFILE" 2>/dev/null || true
-      save_config
-      (cd "$APP_DIR" && docker compose up -d) || true
-      return 1
-    fi
-    remove_lan_firewall_rules "$old_port"
-    firewall_public
-    save_config
-    if wait_for_letsencrypt 120; then
-      ok "PUBLIC режим включен: https://${DOMAIN}"
-    else
-      warn "PUBLIC-режим запущен, но сертификат Let's Encrypt пока не получен. Режим оставлен активным для повторных попыток Caddy."
-      return 1
-    fi
-  else
-    warn "Переключение PUBLIC → LAN отключит внешний HTTPS и оставит TorrServer доступным только из LAN."
-    read -rp "Перейти в LAN? [y/N]: " a
-    [[ "$a" =~ ^[Yy]$ ]] || return
-    MODE="lan"
-    while :; do
-      read -rp "Приватный IPv4 адрес сервера в LAN: " BIND_IP
-      if valid_private_ipv4 "$BIND_IP" && host_has_ipv4 "$BIND_IP"; then break; fi
-      warn "Нужен приватный IPv4, назначенный интерфейсу сервера."
-    done
-    while :; do read -rp "LAN-порт [8090]: " PORT; PORT="${PORT:-8090}"; port_free "$PORT" && break || warn "Порт занят или неверен."; done
-    DOMAIN=""; EMAIL=""
-    write_lan_compose
-    if ! (cd "$APP_DIR" && docker compose down && docker compose pull torrserver && docker compose up -d); then
-      warn "Не удалось включить LAN. Восстанавливаю предыдущий режим."
-      MODE="$old_mode"; PORT="$old_port"; DOMAIN="$old_domain"; EMAIL="$old_email"; BIND_IP="$old_bind"
-      mv -f "${COMPOSE}.mode-backup" "$COMPOSE" 2>/dev/null || true
-      mv -f "${CADDYFILE}.mode-backup" "$CADDYFILE" 2>/dev/null || true
-      save_config
-      (cd "$APP_DIR" && docker compose up -d) || true
-      return 1
-    fi
-    remove_public_firewall_rules
-    firewall_lan
-    save_config
-    ok "LAN режим включен: http://${BIND_IP}:${PORT}"
+  local backup old_mode="$MODE" old_port="$PORT"
+  backup="$(backup_runtime_config)"
+  warn "Смена режима будет выполнена через мастер установки параметров. Backup: $backup"
+  (cd "$APP_DIR" && docker compose down) || true
+  rm -f "$CONF"
+  if install_torr; then
+    if [[ "$old_mode" == "lan" ]]; then remove_lan_firewall_rules "$old_port"; else remove_public_firewall_rules "$old_port"; fi
+    load_config || true
+    if [[ "$MODE" == "lan" ]]; then firewall_lan; else firewall_public; fi
+    ok "Режим успешно изменён."
+    return 0
   fi
-  rm -f "${COMPOSE}.mode-backup" "${CADDYFILE}.mode-backup"
+  warn "Смена режима не завершена. Восстанавливаю предыдущую конфигурацию из $backup"
+  cp -a "$backup/manager.conf" "$CONF" 2>/dev/null || true
+  cp -a "$backup/docker-compose.yml" "$COMPOSE" 2>/dev/null || true
+  [[ -f "$backup/Caddyfile" ]] && cp -a "$backup/Caddyfile" "$CADDYFILE" || rm -f "$CADDYFILE"
+  [[ -f "$backup/.env" ]] && cp -a "$backup/.env" "${APP_DIR}/.env" || true
+  if [[ -d "$backup/config" ]]; then rm -rf "$CONFIG_DIR"; cp -a "$backup/config" "$CONFIG_DIR"; fi
+  if [[ -d "$backup/certs" ]]; then rm -rf "$CERT_DIR"; cp -a "$backup/certs" "$CERT_DIR"; fi
+  (cd "$APP_DIR" && docker compose up -d) || true
+  return 1
 }
 uninstall(){
   [[ -d "$APP_DIR" ]] || { warn "Не установлен."; return; }
@@ -684,38 +750,54 @@ repair_project(){
     return 0
   fi
 
-  valid_domain "$DOMAIN" || die "В manager.conf указан некорректный домен: $DOMAIN"
-  [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "В manager.conf указан некорректный email."
-  check_dns "$DOMAIN" || die "DNS домена не соответствует публичному IP сервера."
-
   remove_lan_firewall_rules "$PORT"
-  firewall_public
-  write_public_compose
-  validate_generated_config
-
-  # Apply current compose/Caddyfile, then remove only stale Let's Encrypt staging account/cert cache.
-  (cd "$APP_DIR" && docker compose up -d --remove-orphans)
-  clear_caddy_staging_state
-  (cd "$APP_DIR" && docker compose restart caddy)
-
-  if wait_for_letsencrypt 180; then
-    ok "PUBLIC-конфигурация восстановлена. HTTPS: https://${DOMAIN}"
-    return 0
-  fi
-
-  warn "Локальная конфигурация исправлена, но Let's Encrypt всё ещё не может завершить внешнюю проверку."
-  warn "Это означает проблему вне хоста: NAT/CGNAT, роутер или firewall/security group провайдера."
-  if command -v tcpdump >/dev/null 2>&1; then
-    echo "Для захвата входящих проверок: sudo tcpdump -ni any 'tcp port 80 or tcp port 443'"
-  fi
-  return 2
+  case "${PUBLIC_TLS:-letsencrypt}" in
+    letsencrypt)
+      valid_domain "$DOMAIN" || die "В manager.conf указан некорректный домен: $DOMAIN"
+      [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "В manager.conf указан некорректный email."
+      check_dns "$DOMAIN" || die "DNS домена не соответствует публичному IP сервера."
+      firewall_public
+      write_public_compose
+      validate_generated_config
+      (cd "$APP_DIR" && docker compose up -d --remove-orphans)
+      clear_caddy_staging_state
+      (cd "$APP_DIR" && docker compose restart caddy)
+      if wait_for_letsencrypt 180; then ok "PUBLIC Let's Encrypt восстановлен: https://${DOMAIN}"; return 0; fi
+      warn "Локальная конфигурация исправлена, но Let's Encrypt не завершил внешнюю проверку. Проверьте NAT/CGNAT/router/provider firewall."
+      return 2
+      ;;
+    selfsigned)
+      [[ -n "$PUBLIC_HOST" ]] || PUBLIC_HOST="$(get_public_ip)"
+      if ! valid_ipv4 "$PUBLIC_HOST" && ! valid_domain "$PUBLIC_HOST"; then die "Некорректный PUBLIC_HOST: $PUBLIC_HOST"; fi
+      if [[ ! -s "$CERT_DIR/torr.crt" || ! -s "$CERT_DIR/torr.key" ]] || ! openssl x509 -checkend 604800 -noout -in "$CERT_DIR/torr.crt" >/dev/null 2>&1; then
+        generate_selfsigned_cert
+      fi
+      firewall_public
+      write_public_compose
+      validate_generated_config
+      (cd "$APP_DIR" && docker compose up -d --remove-orphans)
+      ok "PUBLIC self-signed восстановлен: https://${PUBLIC_HOST}"
+      return 0
+      ;;
+    none)
+      valid_port "$PORT" || die "Некорректный PUBLIC HTTP порт: $PORT"
+      PUBLIC_HOST="${PUBLIC_HOST:-$(get_public_ip)}"
+      firewall_public
+      write_public_compose
+      validate_generated_config
+      (cd "$APP_DIR" && docker compose up -d --remove-orphans)
+      ok "PUBLIC HTTP восстановлен: http://${PUBLIC_HOST}:${PORT}"
+      return 0
+      ;;
+    *) die "Неизвестный PUBLIC_TLS: ${PUBLIC_TLS}" ;;
+  esac
 }
 
 check_letsencrypt(){
   [[ -f "$CONF" ]] || { warn "Не установлен."; return 1; }
   load_config
-  if [[ "$MODE" != "public" ]]; then
-    warn "Let's Encrypt используется только в PUBLIC режиме."
+  if [[ "$MODE" != "public" || "${PUBLIC_TLS:-letsencrypt}" != "letsencrypt" ]]; then
+    warn "check-le применяется только к PUBLIC → Let's Encrypt. Текущий режим: ${MODE}/${PUBLIC_TLS:-none}."
     return 1
   fi
   local failed=0 issuer="" dates=""
@@ -755,8 +837,19 @@ doctor(){
     (cd "$APP_DIR" && docker compose config >/dev/null 2>&1) && ok "Docker Compose config: валиден" || { warn "Docker Compose config: ошибка"; failed=1; }
     [[ -f "$CONFIG_DIR/accs.db" ]] && jq -e 'type=="object"' "$CONFIG_DIR/accs.db" >/dev/null 2>&1 && ok "accs.db: валиден" || { warn "accs.db отсутствует или повреждён"; failed=1; }
     if [[ "$MODE" == "public" ]]; then
-      caddyfile_is_current && ok "Caddyfile: актуальный формат v1.4" || { warn "Caddyfile устарел; выполните: sudo torrserver repair"; failed=1; }
-      check_letsencrypt || failed=1
+      case "${PUBLIC_TLS:-letsencrypt}" in
+        letsencrypt)
+          caddyfile_is_current && ok "Caddyfile: актуальный Let's Encrypt формат v1.5" || { warn "Caddyfile устарел; выполните: sudo torrserver repair"; failed=1; }
+          check_letsencrypt || failed=1
+          ;;
+        selfsigned)
+          caddyfile_is_current && ok "Caddyfile: актуальный self-signed формат v1.5" || { warn "Caddyfile устарел; выполните: sudo torrserver repair"; failed=1; }
+          [[ -s "$CERT_DIR/torr.crt" && -s "$CERT_DIR/torr.key" ]] && openssl x509 -checkend 0 -noout -in "$CERT_DIR/torr.crt" >/dev/null 2>&1 && ok "Самоподписанный сертификат: валиден" || { warn "Самоподписанный сертификат отсутствует/истёк; выполните repair"; failed=1; }
+          ;;
+        none)
+          [[ ! -f "$CADDYFILE" ]] && ok "PUBLIC HTTP: Caddy не используется" || { warn "Для HTTP без TLS найден лишний Caddyfile; выполните repair"; failed=1; }
+          ;;
+      esac
     fi
   else
     info "TorrServer ещё не установлен; проверена только среда менеджера."

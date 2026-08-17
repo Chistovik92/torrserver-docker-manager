@@ -1,0 +1,13 @@
+services:
+  torrserver:
+    image: ghcr.io/yourok/torrserver:${TORRSERVER_VERSION:-latest}
+    container_name: torrserver
+    restart: unless-stopped
+    environment:
+      TS_HTTPAUTH: "1"
+      TS_CONF_PATH: /opt/ts/config
+      TS_PORT: "8090"
+    volumes:
+      - ./config:/opt/ts/config
+    ports:
+      - "0.0.0.0:8090:8090"

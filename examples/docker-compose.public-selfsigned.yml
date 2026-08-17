@@ -1,0 +1,35 @@
+services:
+  torrserver:
+    image: ghcr.io/yourok/torrserver:${TORRSERVER_VERSION:-latest}
+    container_name: torrserver
+    restart: unless-stopped
+    environment:
+      TS_HTTPAUTH: "1"
+      TS_CONF_PATH: /opt/ts/config
+      TS_PORT: "8090"
+    volumes:
+      - ./config:/opt/ts/config
+    expose:
+      - "8090"
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: torrserver-caddy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/certs/torr:/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [internal]
+    depends_on: [torrserver]
+
+networks:
+  internal:
+
+volumes:
+  caddy_data:
+  caddy_config:
