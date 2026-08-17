@@ -164,6 +164,26 @@ MIT. См. `LICENSE`.
 
 > Примечание: проект не содержит исходники TorrServer/Caddy. Используются официальные контейнерные образы, указанные в конфигурации.
 
+## Обновление самого менеджера
+
+Менеджер имеет собственную версию в файле `VERSION` и при запуске меню проверяет GitHub. Источник версии и скрипта: `https://raw.githubusercontent.com/Chistovik92/torrserver-docker-manager/main/`.
+
+Проверить обновление вручную:
+
+```bash
+sudo torrserver check-update
+```
+
+Обновить только менеджер:
+
+```bash
+sudo torrserver self-update
+```
+
+При обновлении скрипт сначала скачивает новую версию во временный файл, проверяет `bash -n`, затем сохраняет резервную копию текущего `manager.sh` и атомарно устанавливает новую версию. Откат на более старую версию через `self-update` автоматически не выполняется.
+
+Проверка GitHub не блокирует работу TorrServer: если GitHub временно недоступен, сервис продолжает работать.
+
 ## Управление после установки
 
 Менеджер устанавливается в `/opt/torr-docker/manager.sh` и вызывается командой `torrserver`.
@@ -175,6 +195,8 @@ torrserver update      # обновить/понизить TorrServer
 torrserver restart     # перезапустить стек
 torrserver logs        # посмотреть логи
 torrserver check-le    # проверить DNS, HTTP challenge и Caddy/Let's Encrypt
+torrserver check-update # проверить новую версию менеджера на GitHub
+torrserver self-update # обновить менеджер с GitHub
 ```
 
 В LAN-режиме Docker публикует TorrServer только на указанный приватный IP-адрес сервера, например `192.168.1.10:8090`.

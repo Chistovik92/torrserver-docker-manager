@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.0
+# TorrServer Docker Manager v1.2.0
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,6 +11,11 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
+MANAGER_VERSION="1.2.0"
+MANAGER_REPO="Chistovik92/torrserver-docker-manager"
+MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
+MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
+VERSION_URL="${MANAGER_RAW_BASE}/VERSION"
 CONF="${APP_DIR}/manager.conf"
 CONFIG_DIR="${APP_DIR}/config"
 COMPOSE="${APP_DIR}/docker-compose.yml"
@@ -23,6 +28,67 @@ die(){ echo -e "\e[31mОшибка: $*\e[0m" >&2; return 1; }
 info(){ echo -e "\e[36m$*\e[0m"; }
 ok(){ echo -e "\e[32m$*\e[0m"; }
 warn(){ echo -e "\e[33m$*\e[0m"; }
+
+version_is_valid(){ [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+version_compare(){
+  local a="$1" b="$2"
+  [[ "$a" == "$b" ]] && return 0
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$b" ]]
+}
+get_remote_manager_version(){
+  curl -4fsSL --max-time 8 "$VERSION_URL" 2>/dev/null | tr -d '[:space:]' || true
+}
+check_manager_update(){
+  local remote
+  remote="$(get_remote_manager_version)"
+  if [[ -z "$remote" ]]; then
+    warn "Не удалось проверить обновление менеджера: GitHub недоступен."
+    return 2
+  fi
+  if ! version_is_valid "$remote"; then
+    warn "GitHub вернул некорректную версию менеджера: $remote"
+    return 2
+  fi
+  if [[ "$remote" == "$MANAGER_VERSION" ]]; then
+    ok "Менеджер актуален: v$MANAGER_VERSION"
+    return 0
+  fi
+  if version_compare "$MANAGER_VERSION" "$remote"; then
+    warn "Доступна новая версия менеджера: v$remote (установлена v$MANAGER_VERSION)"
+    return 1
+  fi
+  warn "На GitHub версия v$remote старше текущей v$MANAGER_VERSION. Обновление не требуется."
+  return 0
+}
+self_update(){
+  require_root
+  local remote tmp backup
+  remote="$(get_remote_manager_version)"
+  [[ -n "$remote" ]] || die "Не удалось получить версию с GitHub."
+  version_is_valid "$remote" || die "Некорректная версия на GitHub: $remote"
+  if [[ "$remote" == "$MANAGER_VERSION" ]]; then
+    ok "Менеджер уже актуален: v$MANAGER_VERSION"
+    return 0
+  fi
+  if ! version_compare "$MANAGER_VERSION" "$remote"; then
+    warn "GitHub содержит v$remote, текущая версия v$MANAGER_VERSION. Откат через self-update не выполняется."
+    return 0
+  fi
+  tmp="$(mktemp)"
+  backup="${APP_DIR}/manager.sh.backup.$(date +%Y%m%d-%H%M%S)"
+  trap 'rm -f "$tmp"' RETURN
+  curl -4fsSL --max-time 30 "$MANAGER_URL" -o "$tmp" || die "Не удалось скачать manager.sh с GitHub."
+  chmod 700 "$tmp"
+  bash -n "$tmp" || die "Скачанный manager.sh содержит синтаксическую ошибку."
+  [[ -s "$tmp" ]] || die "Скачанный manager.sh пустой."
+  mkdir -p "$APP_DIR"
+  if [[ -f "$APP_DIR/manager.sh" ]]; then cp -a "$APP_DIR/manager.sh" "$backup"; fi
+  install -m 755 "$tmp" "$APP_DIR/manager.sh"
+  rm -f "$tmp"
+  trap - RETURN
+  ok "Менеджер обновлён: v$MANAGER_VERSION → v$remote"
+  ok "Резервная копия: $backup"
+}
 
 require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Запустите от root: sudo bash manager.sh"; }
 load_config(){
@@ -390,16 +456,19 @@ main(){
     logs) logs; return ;;
     status) status; return ;;
     check-le|check-ssl|ssl) check_letsencrypt; return ;;
+    check-update|version) check_manager_update; return $? ;;
+    self-update|update-manager) self_update; return ;;
     menu|"") ;;
-    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le}"; return 1 ;;
+    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le|check-update|self-update}"; return 1 ;;
   esac
   while :; do
     echo
     echo "=============================================="
-    echo " TorrServer Docker Manager v1.0 — Chistovik92"
+    echo " TorrServer Docker Manager v${MANAGER_VERSION} — Chistovik92"
     echo "=============================================="
     status
     echo "----------------------------------------------"
+    check_manager_update >/dev/null 2>&1 || true
     echo "1. Установить"
     echo "2. Обновить/понизить версию"
     echo "3. Пользователи"
@@ -407,6 +476,8 @@ main(){
     echo "5. Перезапустить"
     echo "6. Логи"
     echo "7. Удалить"
+    echo "8. Проверить обновление менеджера"
+    echo "9. Обновить сам менеджер с GitHub"
     echo "0. Выход"
     echo "=============================================="
     read -rp "Выбор: " c
@@ -418,6 +489,8 @@ main(){
       5) restart_stack;;
       6) logs;;
       7) uninstall;;
+      8) check_manager_update || true;;
+      9) self_update;;
       0) exit 0;;
       *) warn "Неверный выбор.";;
     esac
