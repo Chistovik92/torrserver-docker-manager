@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.3.0
+# TorrServer Docker Manager v1.3.1
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.3.0"
+MANAGER_VERSION="1.3.1"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -288,12 +288,68 @@ EOF
   cat >"$CADDYFILE" <<EOF
 {
   email ${EMAIL}
-  acme_ca ${LE_ACME_CA}
 }
 ${DOMAIN} {
+  tls {
+    issuer acme {
+      dir ${LE_ACME_CA}
+      test_dir ${LE_ACME_CA}
+      email ${EMAIL}
+    }
+  }
   reverse_proxy torrserver:8090
 }
 EOF
+}
+public_preflight(){
+  local failed=0 public_ip dnsips
+  info "PUBLIC preflight для ${DOMAIN}"
+  public_ip="$(get_public_ip)"
+  dnsips="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u)"
+  if [[ -n "$public_ip" ]]; then
+    ok "Публичный IPv4 сервера: $public_ip"
+  else
+    warn "Не удалось определить публичный IPv4 сервера."; failed=1
+  fi
+  if [[ -n "$dnsips" ]] && grep -qx "$public_ip" <<<"$dnsips"; then
+    ok "DNS A-запись домена указывает на этот сервер."
+  else
+    warn "DNS A-запись не совпадает с публичным IPv4 сервера."; failed=1
+  fi
+  port_free 80 && ok "TCP/80 свободен локально." || { warn "TCP/80 занят локальным процессом."; failed=1; }
+  port_free 443 && ok "TCP/443 свободен локально." || { warn "TCP/443 занят локальным процессом."; failed=1; }
+  if command -v ufw >/dev/null 2>&1; then
+    info "UFW будет настроен на разрешение TCP/80 и TCP/443."
+  fi
+  if (( failed != 0 )); then
+    warn "PUBLIC preflight не пройден."
+    return 1
+  fi
+  warn "Важно: firewall/security group у VPS-провайдера и NAT/роутер тоже должны пропускать входящие TCP/80 и TCP/443."
+}
+local_le_certificate_ok(){
+  local issuer
+  issuer="$(timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null || true)"
+  [[ -n "$issuer" ]] && grep -qi "Let's Encrypt" <<<"$issuer"
+}
+wait_for_letsencrypt(){
+  local timeout_seconds="${1:-120}" elapsed=0
+  info "Ожидание сертификата Let's Encrypt для ${DOMAIN} (до ${timeout_seconds} секунд)..."
+  while (( elapsed < timeout_seconds )); do
+    if local_le_certificate_ok; then
+      ok "Сертификат Let's Encrypt получен и загружен Caddy."
+      return 0
+    fi
+    if docker logs --since 15s torrserver-caddy 2>&1 | grep -qiE 'acme:error:connection|challenge failed|authorization failed'; then
+      warn "Let's Encrypt сообщает об ошибке внешнего подключения. Проверьте доступность TCP/80 и TCP/443 с Интернета."
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  warn "Сертификат Let's Encrypt не получен за ${timeout_seconds} секунд."
+  echo "Последние ACME/TLS сообщения Caddy:"
+  docker logs --tail 120 torrserver-caddy 2>&1 | grep -Ei 'certificate|acme|challenge|authorization|tls|issuer' | tail -n 40 || true
+  return 1
 }
 start_stack(){
   cd "$APP_DIR"
@@ -351,6 +407,7 @@ install_torr(){
     done
     port_free 80 || { warn "Порт 80 уже занят. Освободите его перед PUBLIC-установкой."; return; }
     port_free 443 || { warn "Порт 443 уже занят. Освободите его перед PUBLIC-установкой."; return; }
+    public_preflight || return 1
   else
     DOMAIN=""; EMAIL=""
   fi
@@ -370,15 +427,19 @@ install_torr(){
   fi
 
   start_stack
-  ok "Установка завершена."
   if [[ "$MODE" == "lan" ]]; then
-    local ip
-    ip="$(hostname -I | awk '{print $1}')"
-    ok "LAN: http://${ip}:${PORT}"
+    ok "Установка завершена."
+    ok "LAN: http://${BIND_IP}:${PORT}"
     ok "Docker привязан только к LAN IP: ${BIND_IP}:${PORT}"
   else
-    ok "HTTPS: https://${DOMAIN}"
-    warn "Caddy сам получает и продлевает сертификат Let's Encrypt. Порт 80 должен быть доступен с Интернета."
+    if wait_for_letsencrypt 120; then
+      ok "PUBLIC-установка завершена полностью."
+      ok "HTTPS: https://${DOMAIN}"
+    else
+      warn "Контейнеры запущены, но PUBLIC-установка НЕ завершена: действующий сертификат Let's Encrypt не получен."
+      warn "Исправьте внешний firewall/NAT/маршрутизацию и выполните: sudo torrserver check-le"
+      return 1
+    fi
   fi
 }
 status(){
@@ -472,6 +533,7 @@ switch_mode(){
     port_free 80 || { warn "Порт 80 занят."; return; }
     port_free 443 || { warn "Порт 443 занят."; return; }
     MODE="public"; PORT="443"; BIND_IP=""
+    public_preflight || { MODE="$old_mode"; PORT="$old_port"; DOMAIN="$old_domain"; EMAIL="$old_email"; BIND_IP="$old_bind"; return 1; }
     write_public_compose
     if ! (cd "$APP_DIR" && docker compose down && docker compose pull && docker compose up -d); then
       warn "Не удалось включить PUBLIC. Восстанавливаю предыдущий режим."
@@ -485,7 +547,12 @@ switch_mode(){
     remove_lan_firewall_rules "$old_port"
     firewall_public
     save_config
-    ok "PUBLIC режим включен: https://${DOMAIN}"
+    if wait_for_letsencrypt 120; then
+      ok "PUBLIC режим включен: https://${DOMAIN}"
+    else
+      warn "PUBLIC-режим запущен, но сертификат Let's Encrypt пока не получен. Режим оставлен активным для повторных попыток Caddy."
+      return 1
+    fi
   else
     warn "Переключение PUBLIC → LAN отключит внешний HTTPS и оставит TorrServer доступным только из LAN."
     read -rp "Перейти в LAN? [y/N]: " a
@@ -545,14 +612,14 @@ check_letsencrypt(){
     warn "Контейнер Caddy не запущен."
     failed=1
   fi
-  if timeout 12 openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout >/dev/null 2>&1; then
-    issuer="$(timeout 12 openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null || true)"
-    dates="$(timeout 12 openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -dates 2>/dev/null || true)"
+  if timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout >/dev/null 2>&1; then
+    issuer="$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null || true)"
+    dates="$(timeout 12 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" </dev/null 2>/dev/null | openssl x509 -noout -dates 2>/dev/null || true)"
     echo "$issuer"
     echo "$dates"
     if grep -qi "Let's Encrypt" <<<"$issuer"; then ok "Сертификат выдан Let's Encrypt."; else warn "TLS работает, но издатель не распознан как Let's Encrypt."; failed=1; fi
   else
-    warn "Не удалось получить TLS-сертификат с ${DOMAIN}:443."
+    warn "Caddy локально не отдаёт сертификат для ${DOMAIN}; выпуск Let's Encrypt ещё не завершён."
     failed=1
   fi
   echo "Последние сообщения Caddy об ACME/TLS:"

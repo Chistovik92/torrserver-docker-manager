@@ -59,7 +59,13 @@ EMAIL="admin@example.com"
 write_public_compose
 grep -q '80:80' "$COMPOSE"
 grep -q '443:443' "$COMPOSE"
-grep -q 'acme-v02.api.letsencrypt.org/directory' "$CADDYFILE"
+grep -q 'dir https://acme-v02.api.letsencrypt.org/directory' "$CADDYFILE"
+grep -q 'test_dir https://acme-v02.api.letsencrypt.org/directory' "$CADDYFILE"
+grep -q 'issuer acme' "$CADDYFILE"
+! grep -q 'acme-staging-v02.api.letsencrypt.org' "$CADDYFILE"
 grep -q 'reverse_proxy torrserver:8090' "$CADDYFILE"
+type public_preflight >/dev/null 2>&1
+type wait_for_letsencrypt >/dev/null 2>&1
+type local_le_certificate_ok >/dev/null 2>&1
 
 echo "smoke: OK (manager v${MANAGER_VERSION})"
