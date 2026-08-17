@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec sudo /opt/torr-docker/manager.sh "$@"

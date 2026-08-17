@@ -124,7 +124,7 @@ services:
     volumes:
       - ./config:/opt/ts/config
     ports:
-      - "0.0.0.0:${PORT}:8090"
+      - "${BIND_IP}:${PORT}:8090"
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
@@ -259,8 +259,7 @@ install_torr(){
     local ip
     ip="$(hostname -I | awk '{print $1}')"
     ok "LAN: http://${ip}:${PORT}"
-    warn "LAN-режим не открывает порт в Интернет через UFW; Docker всё равно публикует порт на 0.0.0.0."
-    warn "Если сервер доступен из Интернета, дополнительно закройте порт на внешнем firewall/security-group."
+    ok "Docker привязан только к LAN IP: ${BIND_IP}:${PORT}"
   else
     ok "HTTPS: https://${DOMAIN}"
     warn "Caddy сам получает и продлевает сертификат Let's Encrypt. Порт 80 должен быть доступен с Интернета."
@@ -366,8 +365,34 @@ uninstall(){
   rm -rf "$APP_DIR" "$CERT_DIR"
   ok "Удалено."
 }
+check_letsencrypt(){
+  [[ -f "$CONF" ]] || { warn "Не установлен."; return; }
+  load_config
+  if [[ "$MODE" != "public" ]]; then
+    warn "Let's Encrypt используется только в PUBLIC режиме."
+    return
+  fi
+  info "Проверка Let's Encrypt для ${DOMAIN}"
+  echo "DNS:"
+  getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true
+  echo "HTTP challenge:"
+  curl -I --max-time 10 "http://${DOMAIN}/.well-known/acme-challenge/test" 2>&1 | head -n 5 || true
+  echo "Caddy:"
+  docker exec torrserver-caddy caddy version 2>/dev/null || warn "Контейнер Caddy не запущен."
+  echo "Логи Caddy (последние 30 строк):"
+  docker logs --tail 30 torrserver-caddy 2>&1 || true
+}
 main(){
   require_root
+  case "${1:-}" in
+    update) change_version; return ;;
+    restart) restart_stack; return ;;
+    logs) logs; return ;;
+    status) status; return ;;
+    check-le|check-ssl|ssl) check_letsencrypt; return ;;
+    menu|"") ;;
+    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le}"; return 1 ;;
+  esac
   while :; do
     echo
     echo "=============================================="

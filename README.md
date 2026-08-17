@@ -163,3 +163,18 @@ TORRSERVER_VERSION=MatriX.142.2
 MIT. См. `LICENSE`.
 
 > Примечание: проект не содержит исходники TorrServer/Caddy. Используются официальные контейнерные образы, указанные в конфигурации.
+
+## Управление после установки
+
+Менеджер устанавливается в `/opt/torr-docker/manager.sh` и вызывается командой `torrserver`.
+
+```bash
+torrserver menu        # интерактивное меню
+torrserver status      # состояние контейнеров
+torrserver update      # обновить/понизить TorrServer
+torrserver restart     # перезапустить стек
+torrserver logs        # посмотреть логи
+torrserver check-le    # проверить DNS, HTTP challenge и Caddy/Let's Encrypt
+```
+
+В LAN-режиме Docker публикует TorrServer только на указанный приватный IP-адрес сервера, например `192.168.1.10:8090`.
