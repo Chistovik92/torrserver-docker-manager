@@ -1,0 +1,11 @@
+# Runtime / secrets
+manager.conf
+.env
+*.db
+*.key
+*.crt
+*.pem
+config/
+certs/
+*.log
+.DS_Store
