@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.3.1
+# TorrServer Docker Manager v1.4.0
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.3.1"
+MANAGER_VERSION="1.4.0"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -94,6 +94,14 @@ self_update(){
   trap - RETURN
   ok "Менеджер обновлён: v$MANAGER_VERSION → v$remote"
   ok "Резервная копия: $backup"
+  if [[ -f "$CONF" ]]; then
+    info "Запуск автоматической миграции установленной конфигурации..."
+    if "$APP_DIR/manager.sh" repair; then
+      ok "Миграция конфигурации после self-update завершена."
+    else
+      warn "Менеджер обновлён, но repair требует внимания. Выполните: sudo torrserver repair"
+    fi
+  fi
 }
 
 require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Запустите от root: sudo bash manager.sh"; }
@@ -164,12 +172,63 @@ check_dns(){
 install_packages(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y ca-certificates curl jq ufw openssl cron iproute2
+  apt-get install -y ca-certificates curl jq ufw openssl cron iproute2 tcpdump netcat-openbsd dnsutils
   if ! command -v docker >/dev/null 2>&1; then
     curl -fsSL https://get.docker.com | sh
   fi
   systemctl enable --now docker
   docker compose version >/dev/null 2>&1 || die "Docker Compose plugin не найден."
+}
+ensure_repair_packages(){
+  local missing=() cmd pkg
+  for cmd in curl jq ss ip openssl tcpdump nc dig; do
+    command -v "$cmd" >/dev/null 2>&1 && continue
+    case "$cmd" in
+      ss|ip) pkg="iproute2";;
+      tcpdump) pkg="tcpdump";;
+      nc) pkg="netcat-openbsd";;
+      dig) pkg="dnsutils";;
+      *) pkg="$cmd";;
+    esac
+    missing+=("$pkg")
+  done
+  if ((${#missing[@]})); then
+    info "Установка недостающих диагностических пакетов: ${missing[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y "${missing[@]}"
+  fi
+}
+
+backup_runtime_config(){
+  local stamp dir
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  dir="${APP_DIR}/backups/repair-${stamp}"
+  mkdir -p "$dir"
+  for f in "$CONF" "$COMPOSE" "$CADDYFILE" "${APP_DIR}/.env"; do
+    [[ -f "$f" ]] && cp -a "$f" "$dir/"
+  done
+  [[ -d "$CONFIG_DIR" ]] && cp -a "$CONFIG_DIR" "$dir/config"
+  echo "$dir"
+}
+
+caddyfile_is_current(){
+  [[ -f "$CADDYFILE" ]] || return 1
+  grep -qF "issuer acme" "$CADDYFILE" && \
+  grep -qF "dir ${LE_ACME_CA}" "$CADDYFILE" && \
+  grep -qF "test_dir ${LE_ACME_CA}" "$CADDYFILE"
+}
+
+clear_caddy_staging_state(){
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'torrserver-caddy' || return 0
+  docker exec torrserver-caddy sh -c 'rm -rf /data/caddy/acme/acme-staging-v02.api.letsencrypt.org-directory' >/dev/null 2>&1 || true
+}
+
+validate_generated_config(){
+  (cd "$APP_DIR" && docker compose config >/dev/null) || die "Сгенерированный docker-compose.yml невалиден."
+  if [[ "${MODE:-}" == "public" ]]; then
+    docker run --rm -v "$CADDYFILE:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile >/dev/null || die "Сгенерированный Caddyfile невалиден."
+  fi
 }
 setup_auth(){
   local login pass pass2
@@ -595,6 +654,63 @@ uninstall(){
   rm -rf "$APP_DIR" "$CERT_DIR"
   ok "Удалено."
 }
+repair_project(){
+  require_root
+  [[ -f "$CONF" ]] || { warn "TorrServer не установлен; repair применять не к чему."; return 1; }
+  load_config || die "Не удалось прочитать manager.conf."
+  ensure_repair_packages
+  command -v docker >/dev/null 2>&1 || die "Docker не установлен. Сначала выполните обычную установку менеджера."
+  docker compose version >/dev/null 2>&1 || die "Docker Compose plugin недоступен."
+
+  local backup
+  backup="$(backup_runtime_config)"
+  info "Резервная копия перед восстановлением: $backup"
+
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$CONFIG_DIR/accs.db" ]]; then
+    jq -e 'type=="object"' "$CONFIG_DIR/accs.db" >/dev/null 2>&1 || die "accs.db повреждён; автоматическое восстановление остановлено, backup: $backup"
+    chmod 600 "$CONFIG_DIR/accs.db"
+  fi
+  chmod 600 "$CONF"
+
+  if [[ "$MODE" == "lan" ]]; then
+    valid_private_ipv4 "$BIND_IP" || die "В manager.conf указан некорректный LAN IP: $BIND_IP"
+    host_has_ipv4 "$BIND_IP" || die "LAN IP $BIND_IP не назначен этому серверу."
+    write_lan_compose
+    firewall_lan
+    validate_generated_config
+    (cd "$APP_DIR" && docker compose up -d --remove-orphans)
+    ok "LAN-конфигурация восстановлена: http://${BIND_IP}:${PORT}"
+    return 0
+  fi
+
+  valid_domain "$DOMAIN" || die "В manager.conf указан некорректный домен: $DOMAIN"
+  [[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "В manager.conf указан некорректный email."
+  check_dns "$DOMAIN" || die "DNS домена не соответствует публичному IP сервера."
+
+  remove_lan_firewall_rules "$PORT"
+  firewall_public
+  write_public_compose
+  validate_generated_config
+
+  # Apply current compose/Caddyfile, then remove only stale Let's Encrypt staging account/cert cache.
+  (cd "$APP_DIR" && docker compose up -d --remove-orphans)
+  clear_caddy_staging_state
+  (cd "$APP_DIR" && docker compose restart caddy)
+
+  if wait_for_letsencrypt 180; then
+    ok "PUBLIC-конфигурация восстановлена. HTTPS: https://${DOMAIN}"
+    return 0
+  fi
+
+  warn "Локальная конфигурация исправлена, но Let's Encrypt всё ещё не может завершить внешнюю проверку."
+  warn "Это означает проблему вне хоста: NAT/CGNAT, роутер или firewall/security group провайдера."
+  if command -v tcpdump >/dev/null 2>&1; then
+    echo "Для захвата входящих проверок: sudo tcpdump -ni any 'tcp port 80 or tcp port 443'"
+  fi
+  return 2
+}
+
 check_letsencrypt(){
   [[ -f "$CONF" ]] || { warn "Не установлен."; return 1; }
   load_config
@@ -629,7 +745,7 @@ check_letsencrypt(){
 doctor(){
   local failed=0
   info "Диагностика TorrServer Docker Manager v${MANAGER_VERSION}"
-  for cmd in bash curl docker jq ss ip openssl; do
+  for cmd in bash curl docker jq ss ip openssl tcpdump nc dig; do
     command -v "$cmd" >/dev/null 2>&1 && ok "$cmd: OK" || { warn "$cmd: не найден"; failed=1; }
   done
   docker compose version >/dev/null 2>&1 && ok "docker compose: OK" || { warn "docker compose: недоступен"; failed=1; }
@@ -638,7 +754,10 @@ doctor(){
     [[ -f "$COMPOSE" ]] && ok "docker-compose.yml: найден" || { warn "docker-compose.yml отсутствует"; failed=1; }
     (cd "$APP_DIR" && docker compose config >/dev/null 2>&1) && ok "Docker Compose config: валиден" || { warn "Docker Compose config: ошибка"; failed=1; }
     [[ -f "$CONFIG_DIR/accs.db" ]] && jq -e 'type=="object"' "$CONFIG_DIR/accs.db" >/dev/null 2>&1 && ok "accs.db: валиден" || { warn "accs.db отсутствует или повреждён"; failed=1; }
-    if [[ "$MODE" == "public" ]]; then check_letsencrypt || failed=1; fi
+    if [[ "$MODE" == "public" ]]; then
+      caddyfile_is_current && ok "Caddyfile: актуальный формат v1.4" || { warn "Caddyfile устарел; выполните: sudo torrserver repair"; failed=1; }
+      check_letsencrypt || failed=1
+    fi
   else
     info "TorrServer ещё не установлен; проверена только среда менеджера."
   fi
@@ -656,8 +775,9 @@ main(){
     version) echo "v${MANAGER_VERSION}"; return ;;
     self-update|update-manager) self_update; return ;;
     doctor|check) doctor; return ;;
+    repair|fix) repair_project; return ;;
     menu|"") ;;
-    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le|check-update|self-update|doctor|version}"; return 1 ;;
+    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le|check-update|self-update|doctor|repair|version}"; return 1 ;;
   esac
   while :; do
     echo
@@ -677,6 +797,7 @@ main(){
     echo "8. Проверить обновление менеджера"
     echo "9. Обновить сам менеджер с GitHub"
     echo "10. Диагностика проекта"
+    echo "11. Автовосстановление конфигурации (repair)"
     echo "0. Выход"
     echo "=============================================="
     read -rp "Выбор: " c
@@ -691,6 +812,7 @@ main(){
       8) check_manager_update || true;;
       9) self_update;;
       10) doctor || true;;
+      11) repair_project || true;;
       0) exit 0;;
       *) warn "Неверный выбор.";;
     esac

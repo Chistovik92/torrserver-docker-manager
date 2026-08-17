@@ -1,6 +1,6 @@
 # TorrServer Docker Manager
 
-**Текущая версия менеджера: v1.3.1**  
+**Текущая версия менеджера: v1.4.0**  
 Автор: **Chistovik92**
 
 Docker-менеджер для TorrServer с двумя сценариями развёртывания:
@@ -54,7 +54,7 @@ Docker привязывает опубликованный порт именно
 
 Порты TCP `80` и `443` должны быть свободны на сервере и доступны извне. TorrServer не публикует порт `8090` наружу: запросы идут через Caddy.
 
-В v1.3.1 Caddy использует явный ACME issuer Let's Encrypt. И основной `dir`, и retry `test_dir` закреплены за production endpoint, поэтому после неудачного challenge менеджер не переводит Caddy на staging CA:
+В v1.4.0 Caddy использует явный ACME issuer Let's Encrypt. И основной `dir`, и retry `test_dir` закреплены за production endpoint, поэтому после неудачного challenge менеджер не переводит Caddy на staging CA:
 
 ```text
 https://acme-v02.api.letsencrypt.org/directory
@@ -80,6 +80,7 @@ sudo torrserver check-le        # проверить DNS/Caddy/сертифик�
 sudo torrserver check-update    # проверить новую версию менеджера на GitHub
 sudo torrserver self-update     # обновить manager.sh с GitHub
 sudo torrserver doctor          # комплексная диагностика проекта
+sudo torrserver repair          # автоматически восстановить локальную конфигурацию
 sudo torrserver version         # показать версию менеджера
 ```
 
@@ -143,15 +144,30 @@ sudo torrserver self-update
 5. создаёт резервную копию текущего скрипта;
 6. устанавливает новую версию и обновляет `/opt/torr-docker/VERSION`.
 
-Автоматический downgrade самого менеджера запрещён.
+Автоматический downgrade самого менеджера запрещён. Начиная с v1.4.0 после успешного `self-update` менеджер автоматически запускает миграцию установленного проекта через `repair`, поэтому старые `Caddyfile`/Compose-конфигурации не остаются на предыдущем формате.
 
-## Диагностика
+## Диагностика и автовосстановление
 
 ```bash
 sudo torrserver doctor
+sudo torrserver repair
 ```
 
-Проверяет основные утилиты, Docker Compose, текущий `docker-compose.yml`, JSON базы пользователей и, в PUBLIC-режиме, дополнительно запускает проверку Let's Encrypt.
+`doctor` проверяет основные утилиты, Docker Compose, текущий `docker-compose.yml`, JSON базы пользователей и, в PUBLIC-режиме, актуальность Caddyfile и Let's Encrypt. Также проверяется наличие `tcpdump`, `nc` и `dig`.
+
+`repair` предназначен для автоматического исправления локальной части проекта. Он:
+
+1. устанавливает недостающие диагностические пакеты (`tcpdump`, `netcat-openbsd`, `dnsutils` и др.);
+2. делает резервную копию `manager.conf`, Compose, Caddyfile, `.env` и каталога `config`;
+3. восстанавливает права `0600` для `manager.conf` и `accs.db`;
+4. заново генерирует Compose для текущего режима;
+5. в PUBLIC-режиме заново генерирует актуальный Caddyfile с production Let's Encrypt для `dir` и `test_dir`;
+6. валидирует Compose и Caddyfile до применения;
+7. автоматически восстанавливает UFW-правила;
+8. удаляет только устаревшее staging ACME-состояние Caddy, не удаляя production ACME-данные;
+9. перезапускает Caddy и до 180 секунд ждёт настоящий production-сертификат Let's Encrypt.
+
+Если после этого Let's Encrypt всё ещё получает timeout от внешних валидаторов, менеджер сообщает, что локальная конфигурация исправлена, а оставшаяся проблема находится за пределами хоста: NAT/CGNAT, роутер или firewall/security group провайдера. Такие внешние устройства скрипт намеренно не изменяет.
 
 ## Пользователи
 
@@ -212,6 +228,20 @@ Caddy хранит ACME-состояние и сертификаты в Docker v
 - `MAJOR` — несовместимые изменения поведения/конфигурации;
 - `MINOR` — новые совместимые функции;
 - `PATCH` — исправления без изменения интерфейса.
+
+### v1.4.0 — 2026-08-17
+
+- добавлена команда `sudo torrserver repair` для автоматического восстановления установленного проекта;
+- `self-update` после обновления менеджера автоматически запускает миграцию текущей конфигурации;
+- исправлена проблема, при которой новый manager.sh оставлял старый `Caddyfile` от предыдущей версии;
+- PUBLIC repair заново генерирует Caddyfile с явным ACME issuer и production Let's Encrypt в `dir` и `test_dir`;
+- staging ACME-кэш Caddy очищается отдельно без удаления production-состояния;
+- перед repair автоматически создаётся резервная копия конфигурации и базы пользователей;
+- добавлена автоматическая установка `tcpdump`, `netcat-openbsd` и `dnsutils` для диагностики сети;
+- `doctor` теперь обнаруживает устаревший Caddyfile и предлагает `torrserver repair`;
+- `repair` повторно применяет UFW, Compose, права файлов и проверяет DNS/public IP;
+- после восстановления PUBLIC менеджер до 180 секунд ждёт фактический production-сертификат Let's Encrypt;
+- при проблеме вне сервера выводится точная граница ответственности: NAT/CGNAT/роутер/firewall провайдера нельзя безопасно изменить с самого хоста.
 
 ### v1.3.1 — 2026-08-17
 

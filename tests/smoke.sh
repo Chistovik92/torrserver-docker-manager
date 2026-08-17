@@ -35,7 +35,7 @@ valid_domain torr.example.com
 
 version_compare 1.2.0 1.3.0
 ! version_compare 1.3.0 1.2.0
-version_compare 1.3.0 1.3.0
+version_compare 1.4.0 1.4.0
 version_compare 1.9.9 1.10.0
 
 TMP="$(mktemp -d)"
@@ -67,5 +67,8 @@ grep -q 'reverse_proxy torrserver:8090' "$CADDYFILE"
 type public_preflight >/dev/null 2>&1
 type wait_for_letsencrypt >/dev/null 2>&1
 type local_le_certificate_ok >/dev/null 2>&1
+type repair_project >/dev/null 2>&1
+type caddyfile_is_current >/dev/null 2>&1
+caddyfile_is_current
 
 echo "smoke: OK (manager v${MANAGER_VERSION})"
