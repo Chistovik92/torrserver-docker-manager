@@ -2,7 +2,7 @@ services:
   torrserver:
     image: ghcr.io/yourok/torrserver:${TORRSERVER_VERSION:-latest}
     container_name: torrserver
-    restart: unless-stopped
+    restart: always
     environment:
       TS_HTTPAUTH: "1"
       TS_CONF_PATH: /opt/ts/config
@@ -16,7 +16,7 @@ services:
   caddy:
     image: caddy:2-alpine
     container_name: torrserver-caddy
-    restart: unless-stopped
+    restart: always
     ports:
       - "443:443"
     volumes:

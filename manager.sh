@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.5.0
+# TorrServer Docker Manager v1.6.0
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.5.0"
+MANAGER_VERSION="1.6.0"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -21,6 +21,12 @@ CONFIG_DIR="${APP_DIR}/config"
 COMPOSE="${APP_DIR}/docker-compose.yml"
 CADDYFILE="${APP_DIR}/Caddyfile"
 CERT_DIR="/opt/certs/torr"
+UNIT_NAME="torrserver-docker.service"
+UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
+BOOT_DOCKER_TIMEOUT=120
+BOOT_NET_TIMEOUT=180
+BOOT_CLOCK_TIMEOUT=120
+BIND_IP_CHANGED=0
 IMAGE="ghcr.io/yourok/torrserver"
 DEFAULT_PORT="8090"
 LE_ACME_CA="https://acme-v02.api.letsencrypt.org/directory"
@@ -69,6 +75,9 @@ self_update(){
   version_is_valid "$remote" || die "Некорректная версия на GitHub: $remote"
   if [[ "$remote" == "$MANAGER_VERSION" ]]; then
     ok "Менеджер уже актуален: v$MANAGER_VERSION"
+    if [[ -f "$CONF" ]]; then
+      info "Чтобы поднять сервер после сбоя без потери данных: sudo torrserver start"
+    fi
     return 0
   fi
   if ! version_compare "$MANAGER_VERSION" "$remote"; then
@@ -203,17 +212,155 @@ ensure_repair_packages(){
   fi
 }
 
+systemd_available(){ command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
+detect_lan_ip(){
+  local ip c candidates=()
+  ip="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*[[:space:]]src[[:space:]]\{1,\}\([0-9.]\{1,\}\).*//p' | head -n1 || true)"
+  [[ -n "$ip" ]] && candidates+=("$ip")
+  while read -r c; do
+    [[ -n "$c" ]] && candidates+=("$c")
+  done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)
+  (( ${#candidates[@]} )) || return 1
+  for c in "${candidates[@]}"; do
+    if valid_private_ipv4 "$c"; then printf '%s
+' "$c"; return 0; fi
+  done
+  return 1
+}
+wait_for_docker(){
+  local timeout="${1:-$BOOT_DOCKER_TIMEOUT}" elapsed=0
+  while (( elapsed < timeout )); do
+    if docker info >/dev/null 2>&1; then return 0; fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  docker info >/dev/null 2>&1
+}
+wait_for_clock(){
+  local timeout="${1:-$BOOT_CLOCK_TIMEOUT}" elapsed=0
+  command -v timedatectl >/dev/null 2>&1 || return 0
+  while (( elapsed < timeout )); do
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]]; then
+      ok "Время синхронизировано по NTP."
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  warn "Время не синхронизировано по NTP за ${timeout} с. На платах без RTC это ломает проверку TLS-сертификатов."
+  return 1
+}
+wait_for_lan_ip(){
+  local timeout="${1:-$BOOT_NET_TIMEOUT}" elapsed=0
+  while (( elapsed < timeout )); do
+    if host_has_ipv4 "$BIND_IP"; then return 0; fi
+    if detect_lan_ip >/dev/null 2>&1; then return 1; fi
+    info "Ожидание сетевого адреса ${BIND_IP} (${elapsed}/${timeout} с)..."
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  host_has_ipv4 "$BIND_IP"
+}
+ensure_lan_bind_ip(){
+  local timeout="${1:-0}" detected
+  BIND_IP_CHANGED=0
+  if wait_for_lan_ip "$timeout"; then return 0; fi
+  detected="$(detect_lan_ip || true)"
+  if [[ -z "$detected" ]]; then
+    warn "Приватный IPv4 не найден ни на одном интерфейсе сервера."
+    return 1
+  fi
+  if [[ "$detected" == "$BIND_IP" ]]; then return 0; fi
+  warn "LAN-адрес сервера изменился: ${BIND_IP:-не задан} -> ${detected}."
+  warn "Конфигурация будет обновлена. Данные TorrServer сохраняются без изменений."
+  remove_lan_firewall_rules "$PORT"
+  BIND_IP="$detected"
+  BIND_IP_CHANGED=1
+  save_config
+  ok "Новый LAN-адрес записан в manager.conf: ${BIND_IP}"
+}
+install_systemd_unit(){
+  if ! systemd_available; then
+    warn "systemd недоступен; автозапуск после перезагрузки не настроен."
+    return 0
+  fi
+  cat >"$UNIT_PATH" <<EOF
+[Unit]
+Description=TorrServer Docker Manager stack
+Documentation=https://github.com/${MANAGER_REPO}
+Requires=docker.service
+After=docker.service network-online.target time-sync.target
+Wants=network-online.target
+ConditionPathExists=${CONF}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${APP_DIR}
+ExecStart=/bin/bash ${APP_DIR}/manager.sh boot
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$UNIT_PATH"
+  systemctl daemon-reload
+  if systemctl enable "$UNIT_NAME" >/dev/null 2>&1; then
+    ok "Автозапуск после перезагрузки настроен: ${UNIT_NAME}"
+  else
+    warn "Не удалось включить ${UNIT_NAME} в автозапуск."
+  fi
+}
+remove_systemd_unit(){
+  systemd_available || return 0
+  systemctl disable "$UNIT_NAME" >/dev/null 2>&1 || true
+  rm -f "$UNIT_PATH"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+boot_stack(){
+  require_root
+  if [[ ! -f "$CONF" ]]; then
+    warn "TorrServer не установлен; запускать нечего."
+    return 0
+  fi
+  load_config || die "Не удалось прочитать manager.conf."
+  command -v docker >/dev/null 2>&1 || die "Docker не установлен."
+  wait_for_docker "$BOOT_DOCKER_TIMEOUT" || die "Docker не поднялся за ${BOOT_DOCKER_TIMEOUT} с."
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$CONFIG_DIR/accs.db" ]]; then
+    jq -e 'type=="object"' "$CONFIG_DIR/accs.db" >/dev/null 2>&1 || die "accs.db повреждён; запуск остановлен, данные не тронуты."
+    chmod 600 "$CONFIG_DIR/accs.db"
+  fi
+  if [[ "$MODE" == "lan" ]]; then
+    ensure_lan_bind_ip "$BOOT_NET_TIMEOUT" || die "LAN-адрес сервера не определён; стек не запущен."
+    write_lan_compose
+    if (( BIND_IP_CHANGED == 1 )); then firewall_lan; fi
+  else
+    if [[ "${PUBLIC_TLS:-letsencrypt}" == "letsencrypt" ]]; then
+      wait_for_clock "$BOOT_CLOCK_TIMEOUT" || true
+    fi
+    [[ -f "$COMPOSE" ]] || write_public_compose
+  fi
+  (cd "$APP_DIR" && docker compose up -d --remove-orphans) || die "docker compose up завершился с ошибкой."
+  if [[ "$MODE" == "lan" ]]; then
+    ok "TorrServer запущен: http://${BIND_IP}:${PORT}"
+  else
+    ok "TorrServer запущен в режиме PUBLIC (${PUBLIC_TLS:-letsencrypt})."
+  fi
+}
+
 backup_runtime_config(){
   local stamp dir
   stamp="$(date +%Y%m%d-%H%M%S)"
   dir="${APP_DIR}/backups/repair-${stamp}"
   mkdir -p "$dir"
   for f in "$CONF" "$COMPOSE" "$CADDYFILE" "${APP_DIR}/.env"; do
-    [[ -f "$f" ]] && cp -a "$f" "$dir/"
+    if [[ -f "$f" ]]; then cp -a "$f" "$dir/"; fi
   done
-  [[ -d "$CONFIG_DIR" ]] && cp -a "$CONFIG_DIR" "$dir/config"
-  [[ -d "$CERT_DIR" ]] && cp -a "$CERT_DIR" "$dir/certs"
+  if [[ -d "$CONFIG_DIR" ]]; then cp -a "$CONFIG_DIR" "$dir/config"; fi
+  if [[ -d "$CERT_DIR" ]]; then cp -a "$CERT_DIR" "$dir/certs"; fi
   echo "$dir"
+  return 0
 }
 
 caddyfile_is_current(){
@@ -310,7 +457,7 @@ services:
   torrserver:
     image: ${IMAGE}:\${TORRSERVER_VERSION:-latest}
     container_name: torrserver
-    restart: unless-stopped
+    restart: always
     environment:
       TS_HTTPAUTH: "1"
       TS_CONF_PATH: /opt/ts/config
@@ -332,7 +479,7 @@ services:
   torrserver:
     image: ${IMAGE}:\${TORRSERVER_VERSION:-latest}
     container_name: torrserver
-    restart: unless-stopped
+    restart: always
     environment:
       TS_HTTPAUTH: "1"
       TS_CONF_PATH: /opt/ts/config
@@ -353,7 +500,7 @@ services:
   torrserver:
     image: ${IMAGE}:\${TORRSERVER_VERSION:-latest}
     container_name: torrserver
-    restart: unless-stopped
+    restart: always
     environment:
       TS_HTTPAUTH: "1"
       TS_CONF_PATH: /opt/ts/config
@@ -370,7 +517,7 @@ services:
   caddy:
     image: caddy:2-alpine
     container_name: torrserver-caddy
-    restart: unless-stopped
+    restart: always
     ports:
       - "443:443"
 EOF
@@ -499,7 +646,11 @@ start_stack(){
   docker compose ps
 }
 install_torr(){
-  [[ ! -f "$CONF" ]] || { warn "TorrServer уже установлен. Используйте управление."; return; }
+  if [[ -f "$CONF" ]]; then
+    warn "TorrServer уже установлен. Данные и настройки не тронуты."
+    info "Запустить существующую установку после сбоя: пункт 12 меню или sudo torrserver start"
+    return
+  fi
   local top public_choice public_ip
   while :; do
     echo "============================================="
@@ -588,6 +739,7 @@ install_torr(){
   save_config
   if [[ "$MODE" == "lan" ]]; then write_lan_compose; firewall_lan; else write_public_compose; firewall_public; fi
   validate_generated_config
+  install_systemd_unit
   start_stack
 
   if [[ "$MODE" == "lan" ]]; then
@@ -716,6 +868,7 @@ uninstall(){
     remove_public_firewall_rules
     remove_lan_firewall_rules "${PORT:-$DEFAULT_PORT}"
   fi
+  remove_systemd_unit
   (cd "$APP_DIR" && docker compose down -v 2>/dev/null || true)
   rm -rf "$APP_DIR" "$CERT_DIR"
   ok "Удалено."
@@ -731,6 +884,7 @@ repair_project(){
   local backup
   backup="$(backup_runtime_config)"
   info "Резервная копия перед восстановлением: $backup"
+  install_systemd_unit
 
   mkdir -p "$CONFIG_DIR"
   if [[ -f "$CONFIG_DIR/accs.db" ]]; then
@@ -740,8 +894,8 @@ repair_project(){
   chmod 600 "$CONF"
 
   if [[ "$MODE" == "lan" ]]; then
+    ensure_lan_bind_ip 0 || die "Не удалось определить приватный IPv4 сервера; проверьте сеть."
     valid_private_ipv4 "$BIND_IP" || die "В manager.conf указан некорректный LAN IP: $BIND_IP"
-    host_has_ipv4 "$BIND_IP" || die "LAN IP $BIND_IP не назначен этому серверу."
     write_lan_compose
     firewall_lan
     validate_generated_config
@@ -836,6 +990,22 @@ doctor(){
     [[ -f "$COMPOSE" ]] && ok "docker-compose.yml: найден" || { warn "docker-compose.yml отсутствует"; failed=1; }
     (cd "$APP_DIR" && docker compose config >/dev/null 2>&1) && ok "Docker Compose config: валиден" || { warn "Docker Compose config: ошибка"; failed=1; }
     [[ -f "$CONFIG_DIR/accs.db" ]] && jq -e 'type=="object"' "$CONFIG_DIR/accs.db" >/dev/null 2>&1 && ok "accs.db: валиден" || { warn "accs.db отсутствует или повреждён"; failed=1; }
+    if systemd_available; then
+      if systemctl is-enabled "$UNIT_NAME" >/dev/null 2>&1; then
+        ok "Автозапуск ${UNIT_NAME}: включён"
+      else
+        warn "Автозапуск ${UNIT_NAME} не настроен; выполните: sudo torrserver repair"
+        failed=1
+      fi
+    fi
+    if [[ "$MODE" == "lan" ]]; then
+      if host_has_ipv4 "$BIND_IP"; then
+        ok "LAN-адрес ${BIND_IP}: назначен интерфейсу"
+      else
+        warn "LAN-адрес ${BIND_IP} из manager.conf не назначен серверу; выполните: sudo torrserver start"
+        failed=1
+      fi
+    fi
     if [[ "$MODE" == "public" ]]; then
       case "${PUBLIC_TLS:-letsencrypt}" in
         letsencrypt)
@@ -861,6 +1031,7 @@ main(){
   case "${1:-}" in
     update) change_version; return ;;
     restart) restart_stack; return ;;
+    start|boot|autostart) boot_stack; return ;;
     logs) logs; return ;;
     status) status; return ;;
     check-le|check-ssl|ssl) check_letsencrypt; return ;;
@@ -870,7 +1041,7 @@ main(){
     doctor|check) doctor; return ;;
     repair|fix) repair_project; return ;;
     menu|"") ;;
-    *) echo "Использование: $0 {menu|status|update|restart|logs|check-le|check-update|self-update|doctor|repair|version}"; return 1 ;;
+    *) echo "Использование: $0 {menu|status|start|update|restart|logs|check-le|check-update|self-update|doctor|repair|version}"; return 1 ;;
   esac
   while :; do
     echo
@@ -891,6 +1062,7 @@ main(){
     echo "9. Обновить сам менеджер с GitHub"
     echo "10. Диагностика проекта"
     echo "11. Автовосстановление конфигурации (repair)"
+    echo "12. Запустить сервер после сбоя (данные сохраняются)"
     echo "0. Выход"
     echo "=============================================="
     read -rp "Выбор: " c
@@ -906,6 +1078,7 @@ main(){
       9) self_update;;
       10) doctor || true;;
       11) repair_project || true;;
+      12) boot_stack || true;;
       0) exit 0;;
       *) warn "Неверный выбор.";;
     esac

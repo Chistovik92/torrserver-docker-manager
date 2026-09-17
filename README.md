@@ -1,6 +1,6 @@
 # TorrServer Docker Manager
 
-**Текущая версия менеджера: v1.5.0**  
+**Текущая версия менеджера: v1.6.0**  
 Автор: **Chistovik92**
 
 Docker-менеджер TorrServer с интерактивным выбором внутреннего или внешнего доступа.
@@ -88,6 +88,7 @@ sudo ./manager.sh
 ```bash
 sudo torrserver                 # интерактивное меню
 sudo torrserver status          # режим, тип TLS и URL
+sudo torrserver start           # поднять сервер после сбоя, данные сохраняются
 sudo torrserver update          # обновить/понизить TorrServer
 sudo torrserver restart         # перезапустить текущий стек
 sudo torrserver logs            # логи Docker Compose
@@ -99,6 +100,31 @@ sudo torrserver repair          # восстановить конфигурац�
 sudo torrserver version         # версия менеджера
 ```
 
+## Автозапуск и восстановление после сбоя питания
+
+Установка и `repair` создают systemd-unit `torrserver-docker.service`, который поднимает стек после каждой загрузки:
+
+```ini
+Requires=docker.service
+After=docker.service network-online.target time-sync.target
+Wants=network-online.target
+ExecStart=/bin/bash /opt/torr-docker/manager.sh boot
+```
+
+Unit вызывает `manager.sh boot`, который перед стартом стека:
+
+- ждёт готовности Docker (до 120 с);
+- в LAN-режиме ждёт появления сохранённого `BIND_IP` (до 180 с). Это снимает гонку с DHCP: без ожидания Docker не может привязать порт к ещё не назначенному адресу и контейнер падает с `bind: cannot assign requested address`;
+- если адрес в LAN изменился, подставляет текущий приватный IPv4, переписывает `manager.conf`, Compose и правила UFW;
+- в режиме Let's Encrypt ждёт синхронизации времени по NTP (до 120 с) — на платах без RTC часы после отключения питания уезжают, и Caddy считает валидный сертификат ещё не наступившим;
+- запускает `docker compose up -d --remove-orphans` без `pull`, поэтому восстановление работает и без интернета.
+
+Контейнеры используют `restart: always`, поэтому они переживают и перезапуск самого демона Docker.
+
+Ручной запуск того же сценария — `sudo torrserver start` или пункт 12 меню. Команда не удаляет ни данные, ни настройки: `config/`, `accs.db`, `.env` и сертификаты остаются на месте.
+
+Установки версий до 1.6.0 получают unit автоматически: `sudo torrserver self-update` обновляет менеджер и запускает `repair`, который создаёт и включает unit, не трогая данные.
+
 ## Переключение режимов
 
 Пункт `Переключить LAN / PUBLIC / TLS` запускает тот же двухуровневый мастер. Существующая `/opt/torr-docker/config/accs.db` сохраняется — повторно создавать администратора не требуется.
@@ -109,7 +135,7 @@ sudo torrserver version         # версия менеджера
 
 `sudo torrserver repair` учитывает сохранённые `MODE` и `PUBLIC_TLS`:
 
-- LAN — восстанавливает bind на приватный IP и LAN UFW rules;
+- LAN — восстанавливает bind на приватный IP и LAN UFW rules, а если адрес сервера сменился, подставляет актуальный;
 - Let's Encrypt — пересоздаёт Compose/Caddyfile, очищает только staging ACME state и повторяет production issuance;
 - self-signed — проверяет сертификат и пересоздаёт его, если он отсутствует или истекает менее чем через 7 дней;
 - HTTP без TLS — удаляет Caddy из стека, восстанавливает прямой publish и правило UFW для выбранного порта.
@@ -118,7 +144,7 @@ sudo torrserver version         # версия менеджера
 
 ## doctor
 
-`doctor` проверяет зависимости, Docker Compose, `accs.db` и конфигурацию активного режима. Для Let's Encrypt выполняется ACME/TLS диагностика, для self-signed проверяется сертификат, а для HTTP без TLS проверяется отсутствие лишнего Caddyfile.
+`doctor` проверяет зависимости, Docker Compose, `accs.db`, состояние автозапуска `torrserver-docker.service`, соответствие сохранённого LAN-адреса реальному и конфигурацию активного режима. Для Let's Encrypt выполняется ACME/TLS диагностика, для self-signed проверяется сертификат, а для HTTP без TLS проверяется отсутствие лишнего Caddyfile.
 
 ## Данные
 
@@ -133,6 +159,7 @@ sudo torrserver version         # версия менеджера
 /opt/torr-docker/backups/
 /opt/certs/torr/torr.crt                # self-signed
 /opt/certs/torr/torr.key                # self-signed
+/etc/systemd/system/torrserver-docker.service
 ```
 
 `manager.conf` хранит в том числе `MODE`, `PUBLIC_TLS` и `PUBLIC_HOST`.
@@ -140,6 +167,18 @@ sudo torrserver version         # версия менеджера
 ## Версионность
 
 Проект использует Semantic Versioning: `MAJOR.MINOR.PATCH`.
+
+### v1.6.0
+
+- systemd-unit `torrserver-docker.service` — автозапуск стека после перезагрузки и аварийного отключения питания;
+- команда `torrserver start` (пункт 12 меню) — запуск существующей установки без потери данных;
+- `boot` ждёт Docker, сетевой адрес и, для Let's Encrypt, синхронизацию времени, затем поднимает стек без `pull`;
+- автоматическая миграция LAN-конфигурации на новый адрес сервера, если DHCP выдал другой IP;
+- `restart: always` вместо `unless-stopped`;
+- `doctor` проверяет автозапуск и соответствие сохранённого LAN-адреса;
+- `repair` больше не падает, если LAN-адрес изменился;
+- `backup_runtime_config` переписан на явные `if` и `return 0`, чтобы код резерва не зависел от статуса последней проверки;
+- `.gitattributes` фиксирует LF, CI получил исполняемый бит на `tests/smoke.sh`, ShellCheck запускается с порогом `-S warning`.
 
 ### v1.5.0
 

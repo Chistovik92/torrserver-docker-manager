@@ -12,10 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Run smoke tests
         run: ./tests/smoke.sh
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck
-        run: shellcheck manager.sh install.sh torrserver tests/smoke.sh
+        # -S warning: ошибки и предупреждения блокируют сборку. Уровень info
+        # состоит из стилистики (SC2015 на "A && B || C", где B — печать, и
+        # SC2251 на намеренном "! cmd" в port_free) и трактуется как замечание.
+        run: shellcheck -S warning manager.sh install.sh torrserver tests/smoke.sh

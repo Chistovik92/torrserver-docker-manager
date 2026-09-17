@@ -26,6 +26,8 @@ MODE=lan; PUBLIC_TLS=""; BIND_IP="192.168.1.10"; PORT="8090"
 write_lan_compose
 grep -q '192.168.1.10:8090:8090' "$COMPOSE"
 ! grep -q '0.0.0.0' "$COMPOSE"
+grep -q 'restart: always' "$COMPOSE"
+! grep -q 'unless-stopped' "$COMPOSE"
 
 MODE=public; PUBLIC_TLS=letsencrypt; DOMAIN="torr.example.com"; EMAIL="admin@example.com"; PORT=443; PUBLIC_HOST=""
 write_public_compose
@@ -51,5 +53,54 @@ type public_preflight >/dev/null 2>&1
 type wait_for_letsencrypt >/dev/null 2>&1
 type repair_project >/dev/null 2>&1
 type generate_selfsigned_cert >/dev/null 2>&1
+type boot_stack >/dev/null 2>&1
+type detect_lan_ip >/dev/null 2>&1
+type ensure_lan_bind_ip >/dev/null 2>&1
+type install_systemd_unit >/dev/null 2>&1
+type remove_systemd_unit >/dev/null 2>&1
+type systemd_available >/dev/null 2>&1
+
+[[ "$UNIT_NAME" == "torrserver-docker.service" ]]
+[[ "$UNIT_PATH" == "/etc/systemd/system/torrserver-docker.service" ]]
+grep -q 'start|boot|autostart) boot_stack' manager.sh
+grep -q 'ExecStart=/bin/bash ${APP_DIR}/manager.sh boot' manager.sh
+grep -q 'Wants=network-online.target' manager.sh
+
+# ensure_lan_bind_ip: адрес на месте — конфигурация не трогается
+MODE=lan; PUBLIC_TLS=""; BIND_IP="192.168.1.10"; PORT="8090"; DOMAIN=""; EMAIL=""; PUBLIC_HOST=""; PRIMARY_USER="admin"
+save_config
+host_has_ipv4(){ [[ "$1" == "192.168.1.10" ]]; }
+detect_lan_ip(){ printf '192.168.1.10
+'; }
+remove_lan_firewall_rules(){ :; }
+ensure_lan_bind_ip 0
+[[ "$BIND_IP" == "192.168.1.10" ]]
+[[ "$BIND_IP_CHANGED" == "0" ]]
+
+# ensure_lan_bind_ip: адрес сменился — конфигурация мигрирует, данные не трогаются
+host_has_ipv4(){ return 1; }
+detect_lan_ip(){ printf '192.168.1.55
+'; }
+ensure_lan_bind_ip 0
+[[ "$BIND_IP" == "192.168.1.55" ]]
+[[ "$BIND_IP_CHANGED" == "1" ]]
+grep -q '^BIND_IP=192.168.1.55$' "$CONF"
+grep -q '^PRIMARY_USER=admin$' "$CONF"
+
+# ensure_lan_bind_ip: приватного адреса нет вообще — отказ без изменения конфигурации
+detect_lan_ip(){ return 1; }
+BIND_IP="192.168.1.55"
+! ensure_lan_bind_ip 0
+grep -q '^BIND_IP=192.168.1.55$' "$CONF"
+
+# backup_runtime_config: пропускает отсутствующие файлы и возвращает 0
+MODE=lan; PUBLIC_TLS=""; BIND_IP="192.168.1.10"; PORT="8090"
+CERT_DIR="$TMP/no-such-certs"
+rm -f "$CADDYFILE" "$APP_DIR/.env"
+b="$(backup_runtime_config)"
+[[ -d "$b" ]]
+[[ -f "$b/manager.conf" ]]
+[[ -d "$b/config" ]]
+[[ ! -e "$b/certs" ]]
 
 echo "smoke: OK (manager v${MANAGER_VERSION})"

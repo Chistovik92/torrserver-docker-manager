@@ -2,7 +2,7 @@ services:
   torrserver:
     image: ghcr.io/yourok/torrserver:${TORRSERVER_VERSION:-latest}
     container_name: torrserver
-    restart: unless-stopped
+    restart: always
     environment:
       TS_HTTPAUTH: "1"
       TS_CONF_PATH: /opt/ts/config
