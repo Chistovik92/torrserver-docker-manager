@@ -93,4 +93,14 @@ BIND_IP="192.168.1.55"
 ! ensure_lan_bind_ip 0
 grep -q '^BIND_IP=192.168.1.55$' "$CONF"
 
+# backup_runtime_config: пропускает отсутствующие файлы и возвращает 0
+MODE=lan; PUBLIC_TLS=""; BIND_IP="192.168.1.10"; PORT="8090"
+CERT_DIR="$TMP/no-such-certs"
+rm -f "$CADDYFILE" "$APP_DIR/.env"
+b="$(backup_runtime_config)"
+[[ -d "$b" ]]
+[[ -f "$b/manager.conf" ]]
+[[ -d "$b/config" ]]
+[[ ! -e "$b/certs" ]]
+
 echo "smoke: OK (manager v${MANAGER_VERSION})"

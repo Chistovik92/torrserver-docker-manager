@@ -355,11 +355,12 @@ backup_runtime_config(){
   dir="${APP_DIR}/backups/repair-${stamp}"
   mkdir -p "$dir"
   for f in "$CONF" "$COMPOSE" "$CADDYFILE" "${APP_DIR}/.env"; do
-    [[ -f "$f" ]] && cp -a "$f" "$dir/"
+    if [[ -f "$f" ]]; then cp -a "$f" "$dir/"; fi
   done
-  [[ -d "$CONFIG_DIR" ]] && cp -a "$CONFIG_DIR" "$dir/config"
-  [[ -d "$CERT_DIR" ]] && cp -a "$CERT_DIR" "$dir/certs"
+  if [[ -d "$CONFIG_DIR" ]]; then cp -a "$CONFIG_DIR" "$dir/config"; fi
+  if [[ -d "$CERT_DIR" ]]; then cp -a "$CERT_DIR" "$dir/certs"; fi
   echo "$dir"
+  return 0
 }
 
 caddyfile_is_current(){

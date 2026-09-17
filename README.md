@@ -177,7 +177,8 @@ Unit вызывает `manager.sh boot`, который перед старто�
 - `restart: always` вместо `unless-stopped`;
 - `doctor` проверяет автозапуск и соответствие сохранённого LAN-адреса;
 - `repair` больше не падает, если LAN-адрес изменился;
-- `.gitattributes` фиксирует LF, CI получил исполняемый бит на `tests/smoke.sh`.
+- `backup_runtime_config` переписан на явные `if` и `return 0`, чтобы код резерва не зависел от статуса последней проверки;
+- `.gitattributes` фиксирует LF, CI получил исполняемый бит на `tests/smoke.sh`, ShellCheck запускается с порогом `-S warning`.
 
 ### v1.5.0
 
