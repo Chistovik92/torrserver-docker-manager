@@ -168,4 +168,8 @@ torrents_import "$TMP/t.json" >/dev/null
 grep -q 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$CALLS"
 grep -q '"save_to_db":true' "$CALLS"
 
+# sanitize_input: пробелы, CR и escape-последовательности bracketed paste не должны ломать ввод версии
+[[ "$(sanitize_input "  latest ")" == "latest" ]]
+[[ "$(sanitize_input "$(printf '\033[200~MatriX.142.2\033[201~\r')")" == "MatriX.142.2" ]]
+
 echo "smoke: OK (manager v${MANAGER_VERSION})"

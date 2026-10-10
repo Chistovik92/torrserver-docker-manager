@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.7.0
+# TorrServer Docker Manager v1.7.1
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.7.0"
+MANAGER_VERSION="1.7.1"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -774,11 +774,19 @@ status(){
   fi
   (cd "$APP_DIR" && docker compose ps 2>/dev/null) || true
 }
+# Убирает управляющие последовательности терминала (например, bracketed paste при вставке) и пробелы по краям.
+sanitize_input(){
+  local v
+  v="$(printf '%s' "$1" | sed -e 's/\x1b\[[0-9;?]*[A-Za-z~]//g' | tr -d '\r\000-\010\013-\037')"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  printf '%s' "$v"
+}
 change_version(){
   [[ -f "$COMPOSE" ]] || { warn "Не установлен."; return; }
   local v old backup env_backup
   read -rp "Версия TorrServer (например MatriX.142.2 или latest): " v
-  [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "Недопустимая версия."; return; }
+  v="$(sanitize_input "$v")"
+  [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "Недопустимая версия: $(printf '%q' "$v")"; return 1; }
   old="$(grep -E '^TORRSERVER_VERSION=' "${APP_DIR}/.env" 2>/dev/null | cut -d= -f2- || true)"
   old="${old:-latest}"
   backup="${APP_DIR}/config.backup.$(date +%Y%m%d-%H%M%S)"
