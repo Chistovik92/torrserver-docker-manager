@@ -172,4 +172,20 @@ grep -q '"save_to_db":true' "$CALLS"
 [[ "$(sanitize_input "  latest ")" == "latest" ]]
 [[ "$(sanitize_input "$(printf '\033[200~MatriX.142.2\033[201~\r')")" == "MatriX.142.2" ]]
 
+# Обновление TorrServer: последняя версия берётся из релизов YouROK/TorrServer
+curl(){ echo '{"tag_name":"MatriX.146"}'; }
+[[ "$(get_latest_torrserver_version)" == "MatriX.146" ]]
+curl(){ echo '{"tag_name":"bad tag!"}'; }
+[[ -z "$(get_latest_torrserver_version)" ]]
+curl(){ echo '{"tag_name":"MatriX.146"}'; }
+docker(){ :; }
+printf 'TORRSERVER_VERSION=MatriX.145\n' >"$APP_DIR/.env"
+change_version <<<"" >/dev/null 2>&1                  # Enter = последний релиз
+grep -qx 'TORRSERVER_VERSION=MatriX.146' "$APP_DIR/.env"
+change_version release >/dev/null 2>&1                # уже последняя — ничего не меняет
+grep -qx 'TORRSERVER_VERSION=MatriX.146' "$APP_DIR/.env"
+change_version MatriX.145.2 >/dev/null 2>&1           # явная версия, в т.ч. понижение
+grep -qx 'TORRSERVER_VERSION=MatriX.145.2' "$APP_DIR/.env"
+unset -f curl docker
+
 echo "smoke: OK (manager v${MANAGER_VERSION})"

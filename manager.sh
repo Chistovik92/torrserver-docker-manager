@@ -781,14 +781,41 @@ sanitize_input(){
   v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
   printf '%s' "$v"
 }
+TORRSERVER_REPO="YouROK/TorrServer"
+# Последний релиз исходного TorrServer (MatriX.*) с GitHub; пусто, если GitHub недоступен.
+get_latest_torrserver_version(){
+  local tag
+  tag="$(curl -4fsSL --max-time 8 -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TORRSERVER_REPO}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  [[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]] && printf '%s' "$tag"
+  return 0
+}
 change_version(){
   [[ -f "$COMPOSE" ]] || { warn "Не установлен."; return; }
-  local v old backup env_backup
-  read -rp "Версия TorrServer (например MatriX.142.2 или latest): " v
-  v="$(sanitize_input "$v")"
-  [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "Недопустимая версия: $(printf '%q' "$v")"; return 1; }
+  local v="${1:-}" old backup env_backup latest
   old="$(grep -E '^TORRSERVER_VERSION=' "${APP_DIR}/.env" 2>/dev/null | cut -d= -f2- || true)"
   old="${old:-latest}"
+  if [[ -z "$v" ]]; then
+    latest="$(get_latest_torrserver_version)"
+    info "Установленная версия TorrServer: ${old}"
+    if [[ -n "$latest" ]]; then
+      info "Последний релиз на GitHub (${TORRSERVER_REPO}): ${latest}"
+      read -rp "Версия TorrServer [Enter = ${latest}, либо введите другую или latest]: " v
+      v="${v:-$latest}"
+    else
+      warn "Не удалось получить последнюю версию с GitHub."
+      read -rp "Версия TorrServer (например MatriX.146 или latest): " v
+    fi
+  fi
+  v="$(sanitize_input "$v")"
+  if [[ "$v" == "release" ]]; then
+    v="$(get_latest_torrserver_version)"
+    [[ -n "$v" ]] || { warn "Не удалось получить последнюю версию с GitHub."; return 1; }
+  fi
+  [[ "$v" =~ ^[A-Za-z0-9._-]+$ ]] || { warn "Недопустимая версия: $(printf '%q' "$v")"; return 1; }
+  if [[ "$v" == "$old" && "$v" != "latest" ]]; then
+    ok "Уже установлена версия ${v}."
+    return 0
+  fi
   backup="${APP_DIR}/config.backup.$(date +%Y%m%d-%H%M%S)"
   env_backup="${APP_DIR}/.env.backup.$(date +%Y%m%d-%H%M%S)"
   cp -a "$CONFIG_DIR" "$backup"
@@ -1230,7 +1257,7 @@ backup_menu(){
 main(){
   require_root
   case "${1:-}" in
-    update) change_version; return ;;
+    update) change_version "${2:-}"; return ;;
     restart) restart_stack; return ;;
     start|boot|autostart) boot_stack; return ;;
     logs) logs; return ;;

@@ -89,7 +89,9 @@ sudo ./manager.sh
 sudo torrserver                 # интерактивное меню
 sudo torrserver status          # режим, тип TLS и URL
 sudo torrserver start           # поднять сервер после сбоя, данные сохраняются
-sudo torrserver update          # обновить/понизить TorrServer
+sudo torrserver update          # обновить TorrServer (Enter = последний релиз YouROK/TorrServer)
+sudo torrserver update release  # сразу поставить последний релиз без вопросов
+sudo torrserver update MatriX.145.2  # поставить/понизить до конкретной версии
 sudo torrserver restart         # перезапустить текущий стек
 sudo torrserver logs            # логи Docker Compose
 sudo torrserver check-le        # диагностика Let's Encrypt
@@ -185,6 +187,8 @@ Unit вызывает `manager.sh boot`, который перед старто�
 Проект использует Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 ### v1.7.1
+
+- обновление TorrServer берёт последний релиз из YouROK/TorrServer (GitHub): меню показывает установленную и последнюю версии, Enter ставит последнюю; `torrserver update release` делает это без вопросов, `torrserver update <версия>` ставит конкретную; если версия уже стоит, ничего не пересоздаётся;
 
 - ввод версии TorrServer очищается от пробелов, CR и escape-последовательностей терминала (bracketed paste); при отклонении версии в сообщении показывается, что именно было введено.
 
