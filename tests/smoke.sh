@@ -103,4 +103,69 @@ b="$(backup_runtime_config)"
 [[ -d "$b/config" ]]
 [[ ! -e "$b/certs" ]]
 
+# die завершает действие, а не возвращает управление (иначе "cmd || true" проглатывает ошибку)
+out="$( (die "тест"; echo CONTINUED) 2>&1 || true )"
+! grep -q CONTINUED <<<"$out"
+
+# detect_lan_ip разбирает "src" из ip route (раньше sed печатал пустую строку)
+(
+  ip(){
+    if [[ "$3" == route ]]; then echo "1.1.1.1 via 192.168.7.1 dev eth0 src 192.168.7.20 uid 0"; fi
+  }
+  unset -f detect_lan_ip; source ./manager.sh
+  [[ "$(detect_lan_ip)" == "192.168.7.20" ]]
+)
+
+# switch_mode: отмена мастера установки возвращает прежнюю конфигурацию и код ошибки
+MODE=lan; PUBLIC_TLS=""; BIND_IP="192.168.1.10"; PORT="8090"; DOMAIN=""; EMAIL=""; PUBLIC_HOST=""; PRIMARY_USER="admin"
+host_has_ipv4(){ return 0; }
+save_config; write_lan_compose
+docker(){ :; }
+rc=0; switch_mode <<<"0" >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]]
+[[ -f "$CONF" ]] && grep -q '^BIND_IP=192.168.1.10$' "$CONF"
+[[ -f "$COMPOSE" ]]
+unset -f docker
+
+# Бэкап настроек: архив создаётся, перечисляется и проходит проверку путей
+echo '{"admin":"password1"}' >"$CONFIG_DIR/accs.db"
+docker(){ echo false; }
+backup_create >/dev/null
+[[ -f "$BACKUP_LAST" ]]
+[[ "$(stat -c %a "$BACKUP_LAST")" == "600" ]]
+tar -tzf "$BACKUP_LAST" | grep -q 'config/accs.db'
+tar -tzf "$BACKUP_LAST" | grep -qx 'manager.conf'
+backup_list >/dev/null
+backup_entries_are_safe "$BACKUP_LAST"
+unset -f docker
+
+# Восстановление отвергает архив с посторонними путями
+mkdir "$TMP/evil" && echo x >"$TMP/evil/passwd" && tar -C "$TMP" -czf "$TMP/evil.tar.gz" evil/passwd
+! backup_entries_are_safe "$TMP/evil.tar.gz"
+! backup_restore "$TMP/evil.tar.gz" >/dev/null 2>&1
+
+# Восстановление возвращает настройки из архива
+cp "$CONFIG_DIR/accs.db" "$TMP/accs.saved"
+echo '{"admin":"changed-pass"}' >"$CONFIG_DIR/accs.db"
+docker(){ echo false; }
+boot_stack(){ :; }
+backup_restore "$BACKUP_LAST" <<<"y" >/dev/null
+grep -q 'password1' "$CONFIG_DIR/accs.db"
+unset -f docker
+
+# Список торрентов: экспорт нормализует ответ API, импорт пропускает уже существующие
+container_running(){ return 0; }
+RESP='[{"hash":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","title":"Film One","poster":"p","category":"movie","data":"{}"},{"hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","title":"Two"}]'
+CALLS="$TMP/calls"; : >"$CALLS"
+ts_api(){ if [[ "$2" == *'"list"'* ]]; then echo "$RESP"; else echo "$2" >>"$CALLS"; fi; }
+torrents_export "$TMP/t.json" >/dev/null
+[[ "$(jq length "$TMP/t.json")" == "2" ]]
+[[ "$(jq -r '.[0].hash' "$TMP/t.json")" == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]]
+jq -e '.[0].magnet | startswith("magnet:?xt=urn:btih:aaaa") and endswith("dn=Film%20One")' "$TMP/t.json" >/dev/null
+RESP='[{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","title":"Film One"}]'
+torrents_import "$TMP/t.json" >/dev/null
+[[ "$(wc -l <"$CALLS")" == "1" ]]
+grep -q 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$CALLS"
+grep -q '"save_to_db":true' "$CALLS"
+
 echo "smoke: OK (manager v${MANAGER_VERSION})"

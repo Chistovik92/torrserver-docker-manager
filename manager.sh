@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.6.0
+# TorrServer Docker Manager v1.7.0
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.6.0"
+MANAGER_VERSION="1.7.0"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -31,7 +31,9 @@ IMAGE="ghcr.io/yourok/torrserver"
 DEFAULT_PORT="8090"
 LE_ACME_CA="https://acme-v02.api.letsencrypt.org/directory"
 
-die(){ echo -e "\e[31mОшибка: $*\e[0m" >&2; return 1; }
+# exit, а не return: иначе в контексте "cmd || true" (set -e отключён) выполнение шло бы дальше.
+# Меню запускает каждый пункт в подоболочке, поэтому die завершает только само действие.
+die(){ echo -e "\e[31mОшибка: $*\e[0m" >&2; exit 1; }
 info(){ echo -e "\e[36m$*\e[0m"; }
 ok(){ echo -e "\e[32m$*\e[0m"; }
 warn(){ echo -e "\e[33m$*\e[0m"; }
@@ -86,7 +88,7 @@ self_update(){
   fi
   tmp="$(mktemp)"
   backup="${APP_DIR}/manager.sh.backup.$(date +%Y%m%d-%H%M%S)"
-  trap 'rm -f "$tmp"' RETURN
+  trap 'rm -f "$tmp"' RETURN EXIT
   curl -4fsSL --max-time 30 "$MANAGER_URL" -o "$tmp" || die "Не удалось скачать manager.sh с GitHub."
   chmod 700 "$tmp"
   bash -n "$tmp" || die "Скачанный manager.sh содержит синтаксическую ошибку."
@@ -100,7 +102,7 @@ self_update(){
   printf '%s\n' "$remote" >"$APP_DIR/VERSION"
   chmod 644 "$APP_DIR/VERSION"
   rm -f "$tmp"
-  trap - RETURN
+  trap - RETURN EXIT
   ok "Менеджер обновлён: v$MANAGER_VERSION → v$remote"
   ok "Резервная копия: $backup"
   if [[ -f "$CONF" ]]; then
@@ -215,7 +217,7 @@ ensure_repair_packages(){
 systemd_available(){ command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
 detect_lan_ip(){
   local ip c candidates=()
-  ip="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*[[:space:]]src[[:space:]]\{1,\}\([0-9.]\{1,\}\).*//p' | head -n1 || true)"
+  ip="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*[[:space:]]src[[:space:]]\{1,\}\([0-9.]\{1,\}\).*/\1/p' | head -n1 || true)"
   [[ -n "$ip" ]] && candidates+=("$ip")
   while read -r c; do
     [[ -n "$c" ]] && candidates+=("$c")
@@ -649,7 +651,7 @@ install_torr(){
   if [[ -f "$CONF" ]]; then
     warn "TorrServer уже установлен. Данные и настройки не тронуты."
     info "Запустить существующую установку после сбоя: пункт 12 меню или sudo torrserver start"
-    return
+    return 0
   fi
   local top public_choice public_ip
   while :; do
@@ -682,7 +684,7 @@ install_torr(){
         done
         [[ "$public_choice" == "4" ]] && continue
         ;;
-      0) return ;;
+      0) return 1 ;;
       *) warn "Неверный выбор." ;;
     esac
   done
@@ -705,7 +707,7 @@ install_torr(){
           valid_domain "$DOMAIN" || { warn "Некорректный домен."; continue; }
           check_dns "$DOMAIN" && break
           read -rp "Повторить проверку? [Y/n]: " a
-          [[ "${a:-Y}" =~ ^[Nn]$ ]] && return
+          [[ "${a:-Y}" =~ ^[Nn]$ ]] && return 1
         done
         while :; do
           read -rp "Email для Let's Encrypt: " EMAIL
@@ -842,7 +844,7 @@ switch_mode(){
   warn "Смена режима будет выполнена через мастер установки параметров. Backup: $backup"
   (cd "$APP_DIR" && docker compose down) || true
   rm -f "$CONF"
-  if install_torr; then
+  if (install_torr) && [[ -f "$CONF" ]]; then
     if [[ "$old_mode" == "lan" ]]; then remove_lan_firewall_rules "$old_port"; else remove_public_firewall_rules "$old_port"; fi
     load_config || true
     if [[ "$MODE" == "lan" ]]; then firewall_lan; else firewall_public; fi
@@ -1026,6 +1028,197 @@ doctor(){
   fi
   (( failed == 0 )) && ok "Диагностика завершена без ошибок." || return 1
 }
+# ---------------------------------------------------------------------------
+# Резервные копии настроек TorrServer и список торрентов
+# ---------------------------------------------------------------------------
+BACKUP_LAST=""
+
+container_running(){
+  [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == "true" ]]
+}
+
+# Архив: config/ (config.db, settings.json, accs.db), manager.conf, compose, Caddyfile, .env.
+# Контейнер на время копирования останавливается: config.db — файл BoltDB, живую копию брать нельзя.
+backup_create(){
+  local stamp file item was_running=0 items=()
+  [[ -d "$CONFIG_DIR" ]] || { warn "Каталог настроек $CONFIG_DIR не найден; бэкапить нечего."; return 1; }
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "${APP_DIR}/backups"
+  chmod 700 "${APP_DIR}/backups"
+  file="${APP_DIR}/backups/settings-${stamp}.tar.gz"
+  for item in config manager.conf docker-compose.yml Caddyfile .env; do
+    [[ -e "${APP_DIR}/${item}" ]] && items+=("$item")
+  done
+  if command -v docker >/dev/null 2>&1 && container_running torrserver; then
+    was_running=1
+    info "Остановка TorrServer на время копирования настроек..."
+    docker stop torrserver >/dev/null 2>&1 || true
+  fi
+  local rc=0
+  (umask 077; tar -C "$APP_DIR" -czf "$file" "${items[@]}") || rc=1
+  if (( was_running == 1 )); then
+    docker start torrserver >/dev/null 2>&1 || warn "Не удалось запустить torrserver после бэкапа: sudo torrserver start"
+  fi
+  if (( rc != 0 )); then
+    rm -f "$file"
+    warn "Не удалось создать архив настроек."
+    return 1
+  fi
+  chmod 600 "$file"
+  BACKUP_LAST="$file"
+  ok "Бэкап настроек создан: $file"
+  warn "Архив содержит пароли пользователей (accs.db) — храните его в безопасном месте."
+}
+
+backup_list(){
+  local f found=0
+  for f in "${APP_DIR}/backups"/settings-*.tar.gz; do
+    [[ -e "$f" ]] || continue
+    found=1
+    printf '%s  %s\n' "$(du -h "$f" | cut -f1)" "$f"
+  done
+  (( found == 1 )) || { info "Бэкапов настроек пока нет."; return 1; }
+}
+
+backup_entries_are_safe(){
+  local entry
+  while read -r entry; do
+    [[ "$entry" == *..* ]] && return 1
+    [[ "$entry" =~ ^(\./)?(manager\.conf|docker-compose\.yml|Caddyfile|\.env|config(/.*)?)$ ]] || return 1
+  done < <(tar -tzf "$1" 2>/dev/null)
+}
+
+backup_restore(){
+  local file="${1:-}" files=() f n tmp
+  if [[ -z "$file" ]]; then
+    for f in "${APP_DIR}/backups"/settings-*.tar.gz; do [[ -e "$f" ]] && files+=("$f"); done
+    (( ${#files[@]} )) || { warn "Бэкапов настроек нет."; return 1; }
+    local i=1
+    for f in "${files[@]}"; do echo "$i. $f"; i=$((i + 1)); done
+    read -rp "Номер бэкапа (0 — отмена): " n
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#files[@]} )) || { warn "Отменено."; return 1; }
+    file="${files[$((n - 1))]}"
+  fi
+  [[ -f "$file" ]] || { warn "Файл не найден: $file"; return 1; }
+  tar -tzf "$file" >/dev/null 2>&1 || { warn "Файл не является корректным tar.gz."; return 1; }
+  backup_entries_are_safe "$file" || { warn "В архиве есть посторонние или небезопасные пути; восстановление отменено."; return 1; }
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  tar -C "$tmp" --no-same-owner -xzf "$file"
+  [[ -f "$tmp/manager.conf" && -d "$tmp/config" ]] || { warn "В архиве нет manager.conf или config/."; return 1; }
+  if [[ -f "$tmp/config/accs.db" ]] && ! jq -e 'type=="object"' "$tmp/config/accs.db" >/dev/null 2>&1; then
+    warn "accs.db в архиве повреждён; восстановление отменено."
+    return 1
+  fi
+  warn "Будут заменены: настройки TorrServer, manager.conf и конфигурация compose. Торренты в config.db вернутся к состоянию бэкапа."
+  read -rp "Восстановить из $file? [y/N]: " n
+  [[ "$n" =~ ^[Yy]$ ]] || { warn "Отменено."; return 1; }
+  backup_create || { warn "Не удалось сделать страховочный бэкап текущего состояния; восстановление отменено."; return 1; }
+  info "Страховочный бэкап текущего состояния: $BACKUP_LAST"
+  [[ -f "$COMPOSE" ]] && (cd "$APP_DIR" && docker compose down >/dev/null 2>&1) || true
+  rm -rf "$CONFIG_DIR"
+  cp -a "$tmp/config" "$CONFIG_DIR"
+  for f in manager.conf docker-compose.yml Caddyfile .env; do
+    if [[ -f "$tmp/$f" ]]; then cp -a "$tmp/$f" "${APP_DIR}/$f"; else rm -f "${APP_DIR:?}/$f"; fi
+  done
+  chmod 600 "$CONF"
+  [[ -f "$CONFIG_DIR/accs.db" ]] && chmod 600 "$CONFIG_DIR/accs.db"
+  ok "Настройки восстановлены из $file"
+  boot_stack
+}
+
+# --- Список торрентов через HTTP API TorrServer -----------------------------
+ts_api_base(){
+  local ip
+  ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' torrserver 2>/dev/null | awk '{print $1}')"
+  [[ -n "$ip" ]] || return 1
+  printf 'http://%s:8090' "$ip"
+}
+
+ts_api(){
+  local path="$1" body="$2" base user pass cred
+  base="$(ts_api_base)" || { warn "Контейнер torrserver не запущен или не имеет IP."; return 1; }
+  [[ -f "$CONFIG_DIR/accs.db" ]] || { warn "accs.db не найден."; return 1; }
+  user="${PRIMARY_USER:-}"
+  if [[ -z "$user" ]] || ! jq -e --arg u "$user" 'has($u)' "$CONFIG_DIR/accs.db" >/dev/null 2>&1; then
+    user="$(jq -r 'keys[0] // empty' "$CONFIG_DIR/accs.db")"
+  fi
+  [[ -n "$user" ]] || { warn "В accs.db нет пользователей."; return 1; }
+  pass="$(jq -r --arg u "$user" '.[$u]' "$CONFIG_DIR/accs.db")"
+  cred="${user}:${pass}"
+  cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"
+  # Пароль передаётся через stdin (curl -K -), чтобы не светиться в списке процессов.
+  printf 'user = "%s"\n' "$cred" | curl -fsS --max-time 60 -K - -H 'Content-Type: application/json' -d "$body" "${base}${path}"
+}
+
+torrents_export(){
+  local out="${1:-}" raw
+  [[ -f "$CONF" ]] && load_config || true
+  container_running torrserver || { warn "TorrServer не запущен; список торрентов получить нельзя."; return 1; }
+  raw="$(ts_api /torrents '{"action":"list"}')" || { warn "Не удалось получить список торрентов у TorrServer."; return 1; }
+  jq -e 'type=="array"' <<<"$raw" >/dev/null 2>&1 || { warn "TorrServer вернул неожиданный ответ."; return 1; }
+  if [[ -z "$out" ]]; then
+    mkdir -p "${APP_DIR}/backups"; chmod 700 "${APP_DIR}/backups"
+    out="${APP_DIR}/backups/torrents-$(date +%Y%m%d-%H%M%S).json"
+  fi
+  jq '[ .[] | select(.hash != null and .hash != "") | {
+        hash: (.hash | ascii_downcase),
+        title: (.title // .name // ""),
+        poster: (.poster // ""),
+        category: (.category // ""),
+        data: (.data // ""),
+        magnet: ("magnet:?xt=urn:btih:" + (.hash | ascii_downcase) + "&dn=" + ((.title // .name // "") | @uri))
+      } ]' <<<"$raw" >"$out"
+  chmod 600 "$out"
+  ok "Сохранено торрентов: $(jq 'length' "$out"). Файл: $out"
+  info "В файл попадают хэши и метаданные; трекеры берутся заново из DHT/magnet."
+}
+
+torrents_import(){
+  local file="${1:-}" f files=() n i=1 raw existing item hash body added=0 skipped=0 failed=0
+  [[ -f "$CONF" ]] && load_config || true
+  if [[ -z "$file" ]]; then
+    for f in "${APP_DIR}/backups"/torrents-*.json; do [[ -e "$f" ]] && files+=("$f"); done
+    (( ${#files[@]} )) || { warn "Сохранённых списков торрентов нет."; return 1; }
+    for f in "${files[@]}"; do echo "$i. $f"; i=$((i + 1)); done
+    read -rp "Номер списка (0 — отмена): " n
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#files[@]} )) || { warn "Отменено."; return 1; }
+    file="${files[$((n - 1))]}"
+  fi
+  [[ -f "$file" ]] || { warn "Файл не найден: $file"; return 1; }
+  jq -e 'type=="array" and all(.[]; has("hash"))' "$file" >/dev/null 2>&1 || { warn "Файл не похож на список торрентов, сохранённый менеджером."; return 1; }
+  container_running torrserver || { warn "TorrServer не запущен: sudo torrserver start"; return 1; }
+  raw="$(ts_api /torrents '{"action":"list"}')" || { warn "Не удалось получить текущий список торрентов."; return 1; }
+  existing="$(jq -r '.[].hash | ascii_downcase' <<<"$raw" 2>/dev/null || true)"
+  while read -r item; do
+    hash="$(jq -r '.hash' <<<"$item")"
+    if [[ ! "$hash" =~ ^[0-9a-f]{40}$ && ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then failed=$((failed + 1)); continue; fi
+    if grep -qx "$hash" <<<"$existing"; then skipped=$((skipped + 1)); continue; fi
+    body="$(jq -c '{action:"add", link:.magnet, title:(.title // ""), poster:(.poster // ""), category:(.category // ""), data:(.data // ""), save_to_db:true}' <<<"$item")"
+    if ts_api /torrents "$body" >/dev/null 2>&1; then added=$((added + 1)); else failed=$((failed + 1)); warn "Не добавлен: $hash"; fi
+  done < <(jq -c '.[]' "$file")
+  ok "Импорт завершён: добавлено ${added}, уже было ${skipped}, ошибок ${failed}."
+  (( failed == 0 ))
+}
+
+backup_menu(){
+  local c
+  while :; do
+    echo "1. Создать бэкап настроек  2. Список бэкапов  3. Восстановить из бэкапа"
+    echo "4. Сохранить список торрентов  5. Загрузить список торрентов  0. Назад"
+    read -rp "Выбор: " c
+    case "$c" in
+      1) backup_create || true ;;
+      2) backup_list || true ;;
+      3) backup_restore || true ;;
+      4) torrents_export || true ;;
+      5) torrents_import || true ;;
+      0) return 0 ;;
+      *) warn "Неверный выбор." ;;
+    esac
+  done
+}
+
 main(){
   require_root
   case "${1:-}" in
@@ -1040,8 +1233,21 @@ main(){
     self-update|update-manager) self_update; return ;;
     doctor|check) doctor; return ;;
     repair|fix) repair_project; return ;;
+    backup)
+      case "${2:-create}" in
+        create) backup_create; return ;;
+        list) backup_list; return ;;
+        restore) backup_restore "${3:-}"; return ;;
+        *) echo "Использование: $0 backup {create|list|restore [файл]}"; return 1 ;;
+      esac ;;
+    torrents)
+      case "${2:-export}" in
+        export) torrents_export "${3:-}"; return ;;
+        import) torrents_import "${3:-}"; return ;;
+        *) echo "Использование: $0 torrents {export|import} [файл]"; return 1 ;;
+      esac ;;
     menu|"") ;;
-    *) echo "Использование: $0 {menu|status|start|update|restart|logs|check-le|check-update|self-update|doctor|repair|version}"; return 1 ;;
+    *) echo "Использование: $0 {menu|status|start|update|restart|logs|check-le|check-update|self-update|doctor|repair|backup|torrents|version}"; return 1 ;;
   esac
   while :; do
     echo
@@ -1063,22 +1269,25 @@ main(){
     echo "10. Диагностика проекта"
     echo "11. Автовосстановление конфигурации (repair)"
     echo "12. Запустить сервер после сбоя (данные сохраняются)"
+    echo "13. Бэкап настроек и список торрентов"
     echo "0. Выход"
     echo "=============================================="
     read -rp "Выбор: " c
+    # Каждый пункт идёт в подоболочке: die() завершает только действие, а не всё меню.
     case "$c" in
-      1) install_torr;;
-      2) change_version;;
-      3) manage_users;;
-      4) switch_mode;;
-      5) restart_stack;;
-      6) logs;;
-      7) uninstall;;
+      1) (install_torr) || true;;
+      2) (change_version) || true;;
+      3) (manage_users) || true;;
+      4) (switch_mode) || true;;
+      5) (restart_stack) || true;;
+      6) (logs) || true;;
+      7) (uninstall) || true;;
       8) check_manager_update || true;;
-      9) self_update;;
-      10) doctor || true;;
-      11) repair_project || true;;
-      12) boot_stack || true;;
+      9) (self_update) || true;;
+      10) (doctor) || true;;
+      11) (repair_project) || true;;
+      12) (boot_stack) || true;;
+      13) (backup_menu) || true;;
       0) exit 0;;
       *) warn "Неверный выбор.";;
     esac
