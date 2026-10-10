@@ -188,4 +188,15 @@ change_version MatriX.145.2 >/dev/null 2>&1           # явная версия,
 grep -qx 'TORRSERVER_VERSION=MatriX.145.2' "$APP_DIR/.env"
 unset -f curl docker
 
+# compose_pull_retry: повторяет pull при сбое сети и сдаётся после заданного числа попыток
+PULL_RETRIES=3; PULL_RETRY_DELAY=0; sleep(){ :; }
+N="$TMP/pulls"; echo 0 >"$N"
+docker(){ local c; c=$(<"$N"); echo $((c + 1)) >"$N"; (( c + 1 >= 3 )); }   # успех на 3-й попытке
+compose_pull_retry torrserver >/dev/null 2>&1
+[[ "$(<"$N")" == "3" ]]
+echo 0 >"$N"; docker(){ local c; c=$(<"$N"); echo $((c + 1)) >"$N"; return 1; }
+! compose_pull_retry >/dev/null 2>&1
+[[ "$(<"$N")" == "3" ]]
+unset -f docker sleep
+
 echo "smoke: OK (manager v${MANAGER_VERSION})"

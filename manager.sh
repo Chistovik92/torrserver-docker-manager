@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.7.1
+# TorrServer Docker Manager v1.7.2
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.7.1"
+MANAGER_VERSION="1.7.2"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -641,9 +641,23 @@ wait_for_letsencrypt(){
   docker logs --tail 120 torrserver-caddy 2>&1 | grep -Ei 'certificate|acme|challenge|authorization|tls|issuer' | tail -n 40 || true
   return 1
 }
+# docker compose pull с повторами: на нестабильном канале загрузка слоёв часто обрывается ("connection reset by peer"),
+# а уже скачанные слои при повторе докачиваются.
+PULL_RETRIES="${PULL_RETRIES:-3}"
+PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-5}"
+compose_pull_retry(){
+  local attempt=1
+  while :; do
+    (cd "$APP_DIR" && docker compose pull "$@") && return 0
+    (( attempt < PULL_RETRIES )) || return 1
+    warn "Загрузка образа не удалась (попытка ${attempt}/${PULL_RETRIES}). Повтор через $((attempt * PULL_RETRY_DELAY)) с..."
+    sleep $((attempt * PULL_RETRY_DELAY))
+    attempt=$((attempt + 1))
+  done
+}
 start_stack(){
   cd "$APP_DIR"
-  docker compose pull
+  compose_pull_retry || die "Не удалось скачать образы после ${PULL_RETRIES} попыток."
   docker compose up -d
   docker compose ps
 }
@@ -821,7 +835,7 @@ change_version(){
   cp -a "$CONFIG_DIR" "$backup"
   [[ -f "${APP_DIR}/.env" ]] && cp -a "${APP_DIR}/.env" "$env_backup" || true
   printf 'TORRSERVER_VERSION=%s\n' "$v" >"${APP_DIR}/.env"
-  if ! (cd "$APP_DIR" && docker compose pull torrserver && docker compose up -d torrserver); then
+  if ! (compose_pull_retry torrserver && cd "$APP_DIR" && docker compose up -d torrserver); then
     warn "Обновление не удалось. Выполняется откат на $old."
     printf 'TORRSERVER_VERSION=%s\n' "$old" >"${APP_DIR}/.env"
     (cd "$APP_DIR" && docker compose up -d torrserver) || true
