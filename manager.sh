@@ -921,7 +921,17 @@ uninstall(){
   fi
   remove_systemd_unit
   (cd "$APP_DIR" && docker compose down -v 2>/dev/null || true)
-  rm -rf "$APP_DIR" "$CERT_DIR"
+  rm -rf "$CERT_DIR"
+  if [[ -d "${APP_DIR}/backups" ]] && [[ -n "$(ls -A "${APP_DIR}/backups" 2>/dev/null)" ]]; then
+    read -rp "Удалить также бэкапы (${APP_DIR}/backups)? По умолчанию они сохраняются [y/N]: " b
+    if [[ "$b" =~ ^[Yy]$ ]]; then rm -rf "$APP_DIR"; else
+      find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name backups -exec rm -rf {} +
+      ok "Бэкапы сохранены: ${APP_DIR}/backups"
+    fi
+  else
+    rm -rf "$APP_DIR"
+  fi
+  [[ "$(readlink /usr/local/bin/torrserver 2>/dev/null || true)" == "${APP_DIR}/manager.sh" ]] && rm -f /usr/local/bin/torrserver
   ok "Удалено."
 }
 repair_project(){
@@ -1203,11 +1213,24 @@ ts_api(){
   printf 'user = "%s"\n' "$cred" | curl -fsS --max-time 60 -K - -H 'Content-Type: application/json' -d "$body" "${base}${path}"
 }
 
+# Список торрентов с ожиданием: сразу после (пере)запуска контейнера API TorrServer ещё несколько секунд не отвечает.
+TS_API_RETRIES="${TS_API_RETRIES:-10}"
+ts_list(){
+  local i=1 out
+  while :; do
+    if out="$(ts_api /torrents '{"action":"list"}' 2>/dev/null)"; then printf '%s' "$out"; return 0; fi
+    (( i < TS_API_RETRIES )) || return 1
+    (( i > 1 )) || info "Ожидание ответа TorrServer..." >&2
+    sleep 3
+    i=$((i + 1))
+  done
+}
+
 torrents_export(){
   local out="${1:-}" raw
   [[ -f "$CONF" ]] && load_config || true
   container_running torrserver || { warn "TorrServer не запущен; список торрентов получить нельзя."; return 1; }
-  raw="$(ts_api /torrents '{"action":"list"}')" || { warn "Не удалось получить список торрентов у TorrServer."; return 1; }
+  raw="$(ts_list)" || { warn "Не удалось получить список торрентов у TorrServer."; return 1; }
   jq -e 'type=="array"' <<<"$raw" >/dev/null 2>&1 || { warn "TorrServer вернул неожиданный ответ."; return 1; }
   if [[ -z "$out" ]]; then
     mkdir -p "${APP_DIR}/backups"; chmod 700 "${APP_DIR}/backups"
@@ -1240,7 +1263,7 @@ torrents_import(){
   [[ -f "$file" ]] || { warn "Файл не найден: $file"; return 1; }
   jq -e 'type=="array" and all(.[]; has("hash"))' "$file" >/dev/null 2>&1 || { warn "Файл не похож на список торрентов, сохранённый менеджером."; return 1; }
   container_running torrserver || { warn "TorrServer не запущен: sudo torrserver start"; return 1; }
-  raw="$(ts_api /torrents '{"action":"list"}')" || { warn "Не удалось получить текущий список торрентов."; return 1; }
+  raw="$(ts_list)" || { warn "Не удалось получить текущий список торрентов."; return 1; }
   existing="$(jq -r '.[].hash | ascii_downcase' <<<"$raw" 2>/dev/null || true)"
   while read -r item; do
     hash="$(jq -r '.hash' <<<"$item")"

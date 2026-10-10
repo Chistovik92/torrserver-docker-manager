@@ -238,4 +238,29 @@ grep -qx 'builder prune -a -f' "$DLOG"
 cleanup_docker --bogus >/dev/null 2>&1 && exit 1
 unset -f docker require_root
 
+# uninstall: бэкапы по умолчанию сохраняются, всё остальное удаляется
+U="$TMP/uninst"; mkdir -p "$U/backups" "$U/config"; echo b >"$U/backups/settings-1.tar.gz"; echo c >"$U/manager.conf"
+(
+  APP_DIR="$U"; CONF="$U/manager.conf"; CONFIG_DIR="$U/config"; CERT_DIR="$TMP/uninst-certs"
+  docker(){ :; }; remove_systemd_unit(){ :; }; load_config(){ :; }
+  uninstall <<<$'y\nn' >/dev/null 2>&1
+)
+[[ -f "$U/backups/settings-1.tar.gz" && ! -e "$U/manager.conf" && ! -e "$U/config" ]]
+(
+  APP_DIR="$U"; CONF="$U/manager.conf"; CONFIG_DIR="$U/config"; CERT_DIR="$TMP/uninst-certs"
+  docker(){ :; }; remove_systemd_unit(){ :; }; load_config(){ :; }
+  uninstall <<<$'y\ny' >/dev/null 2>&1
+)
+[[ ! -e "$U" ]]
+
+# ts_list: ждёт, пока API TorrServer начнёт отвечать после перезапуска контейнера
+TS_API_RETRIES=5; sleep(){ :; }
+N="$TMP/tsn"; echo 0 >"$N"
+ts_api(){ local c; c=$(<"$N"); echo $((c + 1)) >"$N"; (( c + 1 >= 3 )) && echo '[]'; }
+[[ "$(ts_list)" == "[]" ]]
+[[ "$(<"$N")" == "3" ]]
+ts_api(){ return 1; }
+! ts_list >/dev/null 2>&1
+unset -f sleep
+
 echo "smoke: OK (manager v${MANAGER_VERSION})"
