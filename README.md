@@ -104,6 +104,8 @@ sudo torrserver backup list    # список бэкапов
 sudo torrserver backup restore [файл]   # восстановить настройки из бэкапа
 sudo torrserver torrents export [файл]  # сохранить список торрентов, висящих в сервере
 sudo torrserver torrents import [файл]  # добавить сохранённые торренты обратно
+sudo torrserver cleanup          # удалить из Docker всё, что не принадлежит менеджеру (с подтверждением)
+sudo torrserver cleanup --dry-run   # только показать, что будет удалено
 sudo torrserver version         # версия менеджера
 ```
 
@@ -187,6 +189,8 @@ Unit вызывает `manager.sh boot`, который перед старто�
 Проект использует Semantic Versioning: `MAJOR.MINOR.PATCH`.
 
 ### v1.7.2
+
+- `torrserver cleanup` (пункт 14 меню) показывает и удаляет всё лишнее в Docker: чужие контейнеры, сети, тома, неиспользуемые образы (в том числе старые теги TorrServer) и кэш сборки. «Своё» определяется по конфигурации: контейнеры `torrserver`/`torrserver-caddy`, сеть и тома проекта compose, образы из `docker compose config --images`. Тома с `config.db`/`accs.db` не удаляются никогда; для работающих чужих контейнеров нужно ввести `yes`; есть `--dry-run` и `--yes`. `doctor` сообщает, если лишнее найдено;
 
 - `docker compose pull` при установке и обновлении TorrServer повторяется до 3 раз с растущей паузой: на нестабильном канале загрузка слоёв образа обрывается (`connection reset by peer`), а при повторе уже скачанные слои докачиваются;
 

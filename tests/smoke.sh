@@ -199,4 +199,43 @@ echo 0 >"$N"; docker(){ local c; c=$(<"$N"); echo $((c + 1)) >"$N"; return 1; }
 [[ "$(<"$N")" == "3" ]]
 unset -f docker sleep
 
+# cleanup: чужое удаляется, своё и тома с данными TorrServer остаются
+MODE=lan; PUBLIC_TLS=""; BIND_IP="192.168.1.10"; PORT="8090"; DOMAIN=""; EMAIL=""; PUBLIC_HOST=""; PRIMARY_USER="admin"
+save_config; write_lan_compose
+mkdir -p "$TMP/vol-ts" "$TMP/vol-radar"; echo '{}' >"$TMP/vol-ts/accs.db"; echo x >"$TMP/vol-radar/data"
+DLOG="$TMP/docker.log"; : >"$DLOG"
+docker(){
+  local a="$*"; a="${a//[$IFS]/ }"
+  case "$a" in
+    "info") return 0 ;;
+    "compose config --images") echo "ghcr.io/yourok/torrserver:MatriX.146" ;;
+    "ps -a --format"*) printf '%s\n' 'torrserver|running|ghcr.io/yourok/torrserver:MatriX.146' 'radar-pg|exited|postgres:16-alpine' ;;
+    "network ls --format"*) printf '%s\n' bridge host none "$(compose_project)_default" "$(compose_project)_internal" ;;
+    "volume ls -q") printf '%s\n' torrserver radar_bot_caddy_data ;;
+    "volume inspect -f {{.Mountpoint}} torrserver") echo "$TMP/vol-ts" ;;
+    "volume inspect -f {{.Mountpoint}} radar_bot_caddy_data") echo "$TMP/vol-radar" ;;
+    "images --format"*) printf '%s\n' 'ghcr.io/yourok/torrserver:MatriX.146|aaa111|209MB' 'ghcr.io/yourok/torrserver:latest|bbb222|208MB' 'python:3.11-slim|ccc333|215MB' '<none>:<none>|ddd444|10MB' ;;
+    *) echo "$a" >>"$DLOG" ;;
+  esac
+}
+require_root(){ :; }
+cleanup_collect
+[[ "${#CLEAN_CONTAINERS[@]}" == "1" && "${CLEAN_CONTAINERS[0]}" == radar-pg* ]]
+[[ "${#CLEAN_NETWORKS[@]}" == "1" && "${CLEAN_NETWORKS[0]}" == *_internal ]]
+[[ "${#CLEAN_VOLUMES[@]}" == "1" && "${CLEAN_VOLUMES[0]}" == radar_bot_caddy_data* ]]
+[[ "${#CLEAN_KEPT_VOLUMES[@]}" == "1" && "${CLEAN_KEPT_VOLUMES[0]}" == torrserver* ]]
+[[ "${#CLEAN_IMAGES[@]}" == "3" ]]
+cleanup_docker --dry-run >/dev/null; [[ ! -s "$DLOG" ]]            # dry-run ничего не трогает
+cleanup_docker --yes >/dev/null 2>&1
+grep -qx 'rm -f radar-pg' "$DLOG"
+grep -qx 'volume rm radar_bot_caddy_data' "$DLOG"
+! grep -q 'volume rm torrserver' "$DLOG"                           # том с accs.db цел
+! grep -q 'rm -f torrserver$' "$DLOG"
+grep -qx 'image rm ghcr.io/yourok/torrserver:latest' "$DLOG"
+grep -qx 'image rm ddd444' "$DLOG"
+! grep -q 'image rm ghcr.io/yourok/torrserver:MatriX.146' "$DLOG"
+grep -qx 'builder prune -a -f' "$DLOG"
+cleanup_docker --bogus >/dev/null 2>&1 && exit 1
+unset -f docker require_root
+
 echo "smoke: OK (manager v${MANAGER_VERSION})"

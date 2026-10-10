@@ -1041,6 +1041,9 @@ doctor(){
     [[ -f "$COMPOSE" ]] && ok "docker-compose.yml: найден" || { warn "docker-compose.yml отсутствует"; failed=1; }
     (cd "$APP_DIR" && docker compose config >/dev/null 2>&1) && ok "Docker Compose config: валиден" || { warn "Docker Compose config: ошибка"; failed=1; }
     [[ -f "$CONFIG_DIR/accs.db" ]] && jq -e 'type=="object"' "$CONFIG_DIR/accs.db" >/dev/null 2>&1 && ok "accs.db: валиден" || { warn "accs.db отсутствует или повреждён"; failed=1; }
+    if cleanup_collect 2>/dev/null && (( $(cleanup_count) > 0 )); then
+      info "Docker: найдено лишних объектов: $(cleanup_count). Посмотреть: sudo torrserver cleanup --dry-run, удалить: sudo torrserver cleanup"
+    fi
     if systemd_available; then
       if systemctl is-enabled "$UNIT_NAME" >/dev/null 2>&1; then
         ok "Автозапуск ${UNIT_NAME}: включён"
@@ -1268,6 +1271,120 @@ backup_menu(){
   done
 }
 
+# ---------------------------------------------------------------------------
+# Очистка Docker от всего, что не относится к менеджеру
+# ---------------------------------------------------------------------------
+CLEAN_CONTAINERS=(); CLEAN_NETWORKS=(); CLEAN_VOLUMES=(); CLEAN_IMAGES=(); CLEAN_KEPT_VOLUMES=()
+
+compose_project(){ basename "$APP_DIR" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9_-'; }
+
+# Собирает списки лишнего. "Своё" определяется по текущей конфигурации: контейнеры torrserver (+caddy в TLS-режимах),
+# сети и тома проекта compose, образы из `docker compose config --images`.
+# Тома с данными TorrServer (config.db / accs.db) никогда не попадают в удаление.
+cleanup_collect(){
+  local proj keep_c keep_n keep_v keep_i row name state image id size mp
+  CLEAN_CONTAINERS=(); CLEAN_NETWORKS=(); CLEAN_VOLUMES=(); CLEAN_IMAGES=(); CLEAN_KEPT_VOLUMES=()
+  command -v docker >/dev/null 2>&1 || { warn "Docker не установлен."; return 1; }
+  docker info >/dev/null 2>&1 || { warn "Docker не отвечает."; return 1; }
+  [[ -f "$COMPOSE" ]] || { warn "Нет $COMPOSE: без него нельзя определить, что принадлежит менеджеру."; return 1; }
+  proj="$(compose_project)"
+  keep_c=" torrserver "; keep_n=" bridge host none ${proj}_default "; keep_v=" "
+  if [[ "${MODE:-}" == "public" && "${PUBLIC_TLS:-letsencrypt}" != "none" ]]; then
+    keep_c+="torrserver-caddy "; keep_n+="${proj}_internal "; keep_v+="${proj}_caddy_data ${proj}_caddy_config "
+  fi
+  keep_i="$(cd "$APP_DIR" && docker compose config --images 2>/dev/null)" || keep_i=""
+  [[ -n "$keep_i" ]] || { warn "Не удалось определить образы менеджера (docker compose config --images); очистка отменена."; return 1; }
+  keep_i=" $(tr '\n' ' ' <<<"$keep_i") "
+
+  while IFS='|' read -r name state image; do
+    [[ -n "$name" ]] || continue
+    [[ "$keep_c" == *" $name "* ]] || CLEAN_CONTAINERS+=("${name}|${state}|${image}")
+  done < <(docker ps -a --format '{{.Names}}|{{.State}}|{{.Image}}')
+
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$keep_n" == *" $name "* ]] || CLEAN_NETWORKS+=("$name")
+  done < <(docker network ls --format '{{.Name}}')
+
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$keep_v" == *" $name "* ]] && continue
+    mp="$(docker volume inspect -f '{{.Mountpoint}}' "$name" 2>/dev/null || true)"
+    size="$(du -sh "$mp" 2>/dev/null | cut -f1 || true)"
+    if [[ -n "$mp" && ( -e "$mp/config.db" || -e "$mp/accs.db" ) ]]; then
+      CLEAN_KEPT_VOLUMES+=("${name}|${size:-?}")
+    else
+      CLEAN_VOLUMES+=("${name}|${size:-?}")
+    fi
+  done < <(docker volume ls -q)
+
+  while IFS='|' read -r name id size; do
+    [[ -n "$id" ]] || continue
+    [[ "$keep_i" == *" $name "* ]] || CLEAN_IMAGES+=("${name}|${id}|${size}")
+  done < <(docker images --format '{{.Repository}}:{{.Tag}}|{{.ID}}|{{.Size}}')
+}
+
+cleanup_count(){ echo $(( ${#CLEAN_CONTAINERS[@]} + ${#CLEAN_NETWORKS[@]} + ${#CLEAN_VOLUMES[@]} + ${#CLEAN_IMAGES[@]} )); }
+
+cleanup_report(){
+  local row name state image id size
+  info "Docker: что останется (принадлежит менеджеру): контейнеры torrserver$([[ "${MODE:-}" == "public" && "${PUBLIC_TLS:-letsencrypt}" != "none" ]] && echo ", torrserver-caddy"), их образы, сеть и тома проекта $(compose_project), каталог ${CONFIG_DIR}."
+  if (( ${#CLEAN_KEPT_VOLUMES[@]} )); then
+    warn "Тома с данными TorrServer НЕ будут удалены (проверьте и удалите вручную, если не нужны):"
+    for row in "${CLEAN_KEPT_VOLUMES[@]}"; do IFS='|' read -r name size <<<"$row"; echo "  том ${name} (${size})"; done
+  fi
+  if (( $(cleanup_count) == 0 )); then ok "Лишних контейнеров, сетей, томов и образов нет."; return 0; fi
+  warn "Будет удалено:"
+  for row in "${CLEAN_CONTAINERS[@]}"; do IFS='|' read -r name state image <<<"$row"; echo "  контейнер ${name} (${state}, ${image})"; done
+  for name in "${CLEAN_NETWORKS[@]}"; do echo "  сеть ${name}"; done
+  for row in "${CLEAN_VOLUMES[@]}"; do IFS='|' read -r name size <<<"$row"; echo "  том ${name} (${size})"; done
+  for row in "${CLEAN_IMAGES[@]}"; do IFS='|' read -r name id size <<<"$row"; echo "  образ ${name} (${size})"; done
+  echo "  кэш сборки Docker (docker builder prune -a)"
+}
+
+cleanup_docker(){
+  require_root
+  local dry=0 yes=0 arg row name state image id a running=0
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run|-n) dry=1 ;;
+      --yes|-y) yes=1 ;;
+      *) warn "Неизвестный параметр: $arg (допустимы --dry-run, --yes)"; return 1 ;;
+    esac
+  done
+  [[ -f "$CONF" ]] || { warn "TorrServer не установлен; очищать нечего."; return 1; }
+  load_config || die "Не удалось прочитать manager.conf."
+  cleanup_collect || return 1
+  cleanup_report
+  (( dry == 1 )) && return 0
+  if (( $(cleanup_count) == 0 )); then
+    docker builder prune -a -f >/dev/null 2>&1 || true
+    return 0
+  fi
+  for row in "${CLEAN_CONTAINERS[@]}"; do IFS='|' read -r name state image <<<"$row"; [[ "$state" == "running" ]] && running=1; done
+  if (( yes == 0 )); then
+    if (( running == 1 )); then
+      warn "Среди удаляемых есть РАБОТАЮЩИЕ контейнеры чужих проектов."
+      read -rp "Для подтверждения введите yes: " a
+      [[ "$a" == "yes" ]] || { warn "Отменено."; return 1; }
+    else
+      read -rp "Удалить перечисленное? [y/N]: " a
+      [[ "$a" =~ ^[Yy]$ ]] || { warn "Отменено."; return 1; }
+    fi
+  fi
+  for row in "${CLEAN_CONTAINERS[@]}"; do IFS='|' read -r name state image <<<"$row"; docker rm -f "$name" >/dev/null 2>&1 || warn "Не удалось удалить контейнер $name"; done
+  for name in "${CLEAN_NETWORKS[@]}"; do docker network rm "$name" >/dev/null 2>&1 || warn "Не удалось удалить сеть $name"; done
+  for row in "${CLEAN_VOLUMES[@]}"; do IFS='|' read -r name _ <<<"$row"; docker volume rm "$name" >/dev/null 2>&1 || warn "Не удалось удалить том $name"; done
+  for row in "${CLEAN_IMAGES[@]}"; do
+    IFS='|' read -r name id _ <<<"$row"
+    if [[ "$name" == "<none>:<none>" ]]; then docker image rm "$id" >/dev/null 2>&1 || true; else docker image rm "$name" >/dev/null 2>&1 || warn "Не удалось удалить образ $name"; fi
+  done
+  docker builder prune -a -f >/dev/null 2>&1 || true
+  docker image prune -f >/dev/null 2>&1 || true
+  ok "Очистка завершена."
+  docker system df || true
+}
+
 main(){
   require_root
   case "${1:-}" in
@@ -1282,6 +1399,7 @@ main(){
     self-update|update-manager) self_update; return ;;
     doctor|check) doctor; return ;;
     repair|fix) repair_project; return ;;
+    cleanup|clean) shift; cleanup_docker "$@"; return ;;
     backup)
       case "${2:-create}" in
         create) backup_create; return ;;
@@ -1296,7 +1414,7 @@ main(){
         *) echo "Использование: $0 torrents {export|import} [файл]"; return 1 ;;
       esac ;;
     menu|"") ;;
-    *) echo "Использование: $0 {menu|status|start|update|restart|logs|check-le|check-update|self-update|doctor|repair|backup|torrents|version}"; return 1 ;;
+    *) echo "Использование: $0 {menu|status|start|update|restart|logs|check-le|check-update|self-update|doctor|repair|backup|torrents|cleanup|version}"; return 1 ;;
   esac
   while :; do
     echo
@@ -1319,6 +1437,7 @@ main(){
     echo "11. Автовосстановление конфигурации (repair)"
     echo "12. Запустить сервер после сбоя (данные сохраняются)"
     echo "13. Бэкап настроек и список торрентов"
+    echo "14. Очистка Docker от лишнего (чужие контейнеры, образы, тома)"
     echo "0. Выход"
     echo "=============================================="
     read -rp "Выбор: " c
@@ -1337,6 +1456,7 @@ main(){
       11) (repair_project) || true;;
       12) (boot_stack) || true;;
       13) (backup_menu) || true;;
+      14) (cleanup_docker) || true;;
       0) exit 0;;
       *) warn "Неверный выбор.";;
     esac
