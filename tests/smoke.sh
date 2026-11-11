@@ -24,8 +24,8 @@ host_has_ipv4(){ return 0; }
 
 MODE=lan; PUBLIC_TLS=""; BIND_IP="192.168.1.10"; PORT="8090"
 write_lan_compose
-grep -q '192.168.1.10:8090:8090' "$COMPOSE"
-! grep -q '0.0.0.0' "$COMPOSE"
+grep -q '0.0.0.0:8090:8090' "$COMPOSE"
+! grep -q '192.168.1.10:8090:8090' "$COMPOSE"
 grep -q 'restart: always' "$COMPOSE"
 ! grep -q 'unless-stopped' "$COMPOSE"
 
@@ -56,6 +56,8 @@ type generate_selfsigned_cert >/dev/null 2>&1
 type boot_stack >/dev/null 2>&1
 type detect_lan_ip >/dev/null 2>&1
 type ensure_lan_bind_ip >/dev/null 2>&1
+type addr_iface >/dev/null 2>&1
+type is_container_bridge_ip >/dev/null 2>&1
 type install_systemd_unit >/dev/null 2>&1
 type remove_systemd_unit >/dev/null 2>&1
 type systemd_available >/dev/null 2>&1
@@ -114,6 +116,21 @@ out="$( (die "тест"; echo CONTINUED) 2>&1 || true )"
   }
   unset -f detect_lan_ip; source ./manager.sh
   [[ "$(detect_lan_ip)" == "192.168.7.20" ]]
+)
+
+# detect_lan_ip игнорирует мосты Docker/CNI (docker0, br-*): иначе LAN-адресом мог стать 172.17.0.1
+(
+  ip(){
+    if [[ "$3" == route ]]; then return 1; fi
+    if [[ "$3" == addr ]]; then
+      printf '%s\n' \
+        '2: eth0    inet 192.168.2.69/24 scope global eth0' \
+        '3: docker0    inet 172.17.0.1/16 scope global docker0' \
+        '4: br-d69b7dd6648c    inet 172.20.0.1/16 scope global br-d69b7dd6648c'
+    fi
+  }
+  unset -f detect_lan_ip addr_iface is_container_bridge_ip; source ./manager.sh
+  [[ "$(detect_lan_ip)" == "192.168.2.69" ]]
 )
 
 # switch_mode: отмена мастера установки возвращает прежнюю конфигурацию и код ошибки

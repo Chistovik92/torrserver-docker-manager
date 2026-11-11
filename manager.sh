@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TorrServer Docker Manager v1.7.2
+# TorrServer Docker Manager v1.7.3
 # Author: Chistovik92
 # Supports:
 #   1) LAN mode: TorrServer exposed over HTTP to the local network, no Let's Encrypt.
@@ -11,7 +11,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_DIR="/opt/torr-docker"
-MANAGER_VERSION="1.7.2"
+MANAGER_VERSION="1.7.3"
 MANAGER_REPO="Chistovik92/torrserver-docker-manager"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/main"
 MANAGER_URL="${MANAGER_RAW_BASE}/manager.sh"
@@ -215,17 +215,25 @@ ensure_repair_packages(){
 }
 
 systemd_available(){ command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
+
+# Имя интерфейса, на котором назначен IPv4-адрес (пусто, если такого адреса нет).
+addr_iface(){ ip -o -4 addr show 2>/dev/null | awk -v ip="$1" '{split($4,a,"/"); if (a[1]==ip){print $2; exit}}' || true; }
+
+# True, если адрес висит на мосту Docker/CNI (docker0, br-*, veth* и т.п.), а не на
+# реальном сетевом интерфейсе хоста. Такие адреса нельзя использовать как LAN-адрес.
+is_container_bridge_ip(){ local iface; iface="$(addr_iface "$1")"; [[ -n "$iface" && "$iface" =~ ^(docker|br-|veth|virbr|flannel|cni|lxc) ]]; }
+
 detect_lan_ip(){
   local ip c candidates=()
   ip="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.*[[:space:]]src[[:space:]]\{1,\}\([0-9.]\{1,\}\).*/\1/p' | head -n1 || true)"
-  [[ -n "$ip" ]] && candidates+=("$ip")
+  if [[ -n "$ip" ]] && valid_private_ipv4 "$ip" && ! is_container_bridge_ip "$ip"; then candidates+=("$ip"); fi
   while read -r c; do
     [[ -n "$c" ]] && candidates+=("$c")
-  done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true)
+  done < <(ip -o -4 addr show scope global 2>/dev/null \
+    | awk '$2 !~ /^(docker|br-|veth|virbr|flannel|cni|lxc)/ {split($4,a,"/"); print a[1]}' || true)
   (( ${#candidates[@]} )) || return 1
   for c in "${candidates[@]}"; do
-    if valid_private_ipv4 "$c"; then printf '%s
-' "$c"; return 0; fi
+    if valid_private_ipv4 "$c"; then printf '%s\n' "$c"; return 0; fi
   done
   return 1
 }
@@ -255,13 +263,13 @@ wait_for_clock(){
 wait_for_lan_ip(){
   local timeout="${1:-$BOOT_NET_TIMEOUT}" elapsed=0
   while (( elapsed < timeout )); do
-    if host_has_ipv4 "$BIND_IP"; then return 0; fi
+    if host_has_ipv4 "$BIND_IP" && ! is_container_bridge_ip "$BIND_IP"; then return 0; fi
     if detect_lan_ip >/dev/null 2>&1; then return 1; fi
     info "Ожидание сетевого адреса ${BIND_IP} (${elapsed}/${timeout} с)..."
     sleep 5
     elapsed=$((elapsed + 5))
   done
-  host_has_ipv4 "$BIND_IP"
+  host_has_ipv4 "$BIND_IP" && ! is_container_bridge_ip "$BIND_IP"
 }
 ensure_lan_bind_ip(){
   local timeout="${1:-0}" detected
@@ -334,7 +342,7 @@ boot_stack(){
     chmod 600 "$CONFIG_DIR/accs.db"
   fi
   if [[ "$MODE" == "lan" ]]; then
-    ensure_lan_bind_ip "$BOOT_NET_TIMEOUT" || die "LAN-адрес сервера не определён; стек не запущен."
+    ensure_lan_bind_ip "$BOOT_NET_TIMEOUT" || warn "LAN-адрес сервера не определён; TorrServer будет слушать на всех интерфейсах (0.0.0.0)."
     write_lan_compose
     if (( BIND_IP_CHANGED == 1 )); then firewall_lan; fi
   else
@@ -345,7 +353,7 @@ boot_stack(){
   fi
   (cd "$APP_DIR" && docker compose up -d --remove-orphans) || die "docker compose up завершился с ошибкой."
   if [[ "$MODE" == "lan" ]]; then
-    ok "TorrServer запущен: http://${BIND_IP}:${PORT}"
+    if [[ -n "$BIND_IP" ]]; then ok "TorrServer запущен: http://${BIND_IP}:${PORT}"; else ok "TorrServer запущен: порт ${PORT} доступен на всех интерфейсах."; fi
   else
     ok "TorrServer запущен в режиме PUBLIC (${PUBLIC_TLS:-letsencrypt})."
   fi
@@ -452,8 +460,6 @@ firewall_public(){
   ufw --force enable
 }
 write_lan_compose(){
-  valid_private_ipv4 "$BIND_IP" || die "Для LAN режима BIND_IP должен быть корректным приватным IPv4-адресом."
-  host_has_ipv4 "$BIND_IP" || die "IP $BIND_IP не назначен ни одному IPv4-интерфейсу этого сервера."
   cat >"$COMPOSE" <<EOF
 services:
   torrserver:
@@ -467,7 +473,7 @@ services:
     volumes:
       - ./config:/opt/ts/config
     ports:
-      - "${BIND_IP}:${PORT}:8090"
+      - "0.0.0.0:${PORT}:8090"
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
@@ -706,8 +712,8 @@ install_torr(){
   if [[ "$MODE" == "lan" ]]; then
     while :; do
       read -rp "Приватный IPv4 адрес сервера в LAN (например 192.168.1.10): " BIND_IP
-      valid_private_ipv4 "$BIND_IP" && host_has_ipv4 "$BIND_IP" && break
-      warn "Нужен приватный IPv4, реально назначенный интерфейсу сервера."
+      valid_private_ipv4 "$BIND_IP" && host_has_ipv4 "$BIND_IP" && ! is_container_bridge_ip "$BIND_IP" && break
+      warn "Нужен приватный IPv4, реально назначенный сетевому интерфейсу сервера (не Docker-мосту)."
     done
     while :; do read -rp "Порт TorrServer [${DEFAULT_PORT}]: " PORT; PORT="${PORT:-$DEFAULT_PORT}"; port_free "$PORT" && break || warn "Порт занят или неверен."; done
     DOMAIN=""; EMAIL=""; PUBLIC_HOST=""
@@ -785,6 +791,9 @@ status(){
     echo "LAN IP: $BIND_IP"
     echo "URL: http://$BIND_IP:$PORT"
     echo "Порт: $PORT"
+    if ! host_has_ipv4 "$BIND_IP" 2>/dev/null || is_container_bridge_ip "$BIND_IP"; then
+      warn "Адрес ${BIND_IP} не назначен реальному интерфейсу сервера. Порт слушает на всех интерфейсах (0.0.0.0); выполните: sudo torrserver start"
+    fi
   fi
   (cd "$APP_DIR" && docker compose ps 2>/dev/null) || true
 }
@@ -955,13 +964,12 @@ repair_project(){
   chmod 600 "$CONF"
 
   if [[ "$MODE" == "lan" ]]; then
-    ensure_lan_bind_ip 0 || die "Не удалось определить приватный IPv4 сервера; проверьте сеть."
-    valid_private_ipv4 "$BIND_IP" || die "В manager.conf указан некорректный LAN IP: $BIND_IP"
+    ensure_lan_bind_ip 0 || warn "LAN-адрес сервера не определён; стек будет слушать на всех интерфейсах (0.0.0.0)."
     write_lan_compose
     firewall_lan
     validate_generated_config
     (cd "$APP_DIR" && docker compose up -d --remove-orphans)
-    ok "LAN-конфигурация восстановлена: http://${BIND_IP}:${PORT}"
+    if [[ -n "$BIND_IP" ]]; then ok "LAN-конфигурация восстановлена: http://${BIND_IP}:${PORT}"; else ok "LAN-конфигурация восстановлена: порт ${PORT} доступен на всех интерфейсах."; fi
     return 0
   fi
 
@@ -1063,10 +1071,10 @@ doctor(){
       fi
     fi
     if [[ "$MODE" == "lan" ]]; then
-      if host_has_ipv4 "$BIND_IP"; then
-        ok "LAN-адрес ${BIND_IP}: назначен интерфейсу"
+      if host_has_ipv4 "$BIND_IP" && ! is_container_bridge_ip "$BIND_IP"; then
+        ok "LAN-адрес ${BIND_IP}: назначен реальному интерфейсу"
       else
-        warn "LAN-адрес ${BIND_IP} из manager.conf не назначен серверу; выполните: sudo torrserver start"
+        warn "LAN-адрес ${BIND_IP} из manager.conf не назначен реальному интерфейсу; выполните: sudo torrserver start"
         failed=1
       fi
     fi
